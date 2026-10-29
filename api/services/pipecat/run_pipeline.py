@@ -721,6 +721,22 @@ async def _run_pipeline_impl(
             logger.info(f"regional_language_style applied: {_regional_applied}")
     except Exception as _regional_err:  # never block a call on style injection
         logger.warning(f"regional_language_style skipped: {_regional_err}")
+    # Platform rules shared by every AI Employee (workflow_configurations.astra_universal_rules,
+    # written by the console to every employee's workflow). No-op when the key is absent.
+    try:
+        from api.services.pipecat.universal_rules import (
+            UNIVERSAL_RULES_KEY,
+            apply_universal_rules_to_graph,
+            load_tool_function_names,
+        )
+
+        if run_configs.get(UNIVERSAL_RULES_KEY):
+            _ur_tools = await load_tool_function_names(workflow_graph, workflow.organization_id)
+            _ur_applied = apply_universal_rules_to_graph(workflow_graph, run_configs, _ur_tools)
+            if _ur_applied:
+                logger.info(f"universal_rules applied: {_ur_applied}")
+    except Exception as _ur_err:  # never block a call on rules injection
+        logger.warning(f"universal_rules skipped: {_ur_err}")
     # Generic Product Knowledge + Configured Actions/Tools (opt-in via
     # workflow_configurations.product_knowledge). Tools are detected from this
     # workflow's own nodes. No-op for workflows without product_knowledge.
