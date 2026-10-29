@@ -1,0 +1,797 @@
+import httpx
+import pytest
+
+from api.errors.failure import ErrorType
+from api.errors.mps import MPSUnavailableError
+from api.services import mps_service_key_client as mps_client_module
+from api.services.mps_service_key_client import MPSServiceKeyClient
+
+
+class _Response:
+    def __init__(self, status_code: int, payload: dict | None = None, text: str = ""):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.text = text
+        self.request = object()
+
+    def json(self):
+        return self._payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    (
+        "deployment_mode",
+        "organization_id",
+        "created_by",
+        "mps_secret",
+        "expected_headers",
+    ),
+    [
+        (
+            "oss",
+            None,
+            "oss_123_11111111-1111-4111-8111-111111111111",
+            None,
+            {
+                "Content-Type": "application/json",
+                "X-Created-By": ("oss_123_11111111-1111-4111-8111-111111111111"),
+            },
+        ),
+        (
+            "saas",
+            42,
+            "11111111-1111-4111-8111-111111111111",
+            "dograh-mps-secret",
+            {
+                "Content-Type": "application/json",
+                "X-Secret-Key": "dograh-mps-secret",
+                "X-Organization-Id": "42",
+            },
+        ),
+    ],
+)
+async def test_ensure_cloudonix_domain_uses_owner_scope_headers(
+    monkeypatch,
+    deployment_mode,
+    organization_id,
+    created_by,
+    mps_secret,
+    expected_headers,
+):
+    calls = []
+    payload = {
+        "provisioning_id": "11111111-1111-4111-8111-111111111111",
+        "domain_name": "oss-dograh-11111111",
+        "domain_uuid": "22222222-2222-4222-8222-222222222222",
+        "bearer_token": "domain-bearer",
+        "status": "ready",
+    }
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def put(self, url, headers):
+            calls.append((url, headers))
+            return _Response(200, payload)
+
+    monkeypatch.setattr(mps_client_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(mps_client_module, "DEPLOYMENT_MODE", deployment_mode)
+    monkeypatch.setattr(mps_client_module, "DOGRAH_MPS_SECRET_KEY", mps_secret)
+    client = MPSServiceKeyClient()
+
+    assert (
+        await client.ensure_cloudonix_domain(
+            organization_id=organization_id,
+            created_by=created_by,
+        )
+        == payload
+    )
+    assert calls == [
+        (
+            f"{client.base_url}/api/v1/cloudonix/domains/self",
+            expected_headers,
+        )
+    ]
+
+
+def test_validate_service_key_uses_bearer_self_usage(monkeypatch):
+    calls = []
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def get(self, url, headers):
+            calls.append(("GET", url, headers))
+            return _Response(200)
+
+    monkeypatch.setattr("api.services.mps_service_key_client.httpx.Client", FakeClient)
+
+    client = MPSServiceKeyClient()
+
+    assert client.validate_service_key("mps_sk_paid") is True
+    assert calls == [
+        (
+            "GET",
+            f"{client.base_url}/api/v1/service-keys/usage/self",
+            {
+                "Authorization": "Bearer mps_sk_paid",
+                "Content-Type": "application/json",
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize("status_code", [401, 403])
+def test_validate_service_key_returns_false_only_for_auth_rejection(
+    monkeypatch,
+    status_code,
+):
+    emitted = []
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def get(self, url, headers):
+            return _Response(status_code)
+
+    monkeypatch.setattr(mps_client_module.httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        mps_client_module,
+        "log_failure",
+        lambda failure, **context: emitted.append((failure, context)),
+    )
+
+    assert MPSServiceKeyClient().validate_service_key("mps_sk_invalid") is False
+    assert emitted == []
+
+
+def test_validate_service_key_classifies_mps_http_failure(monkeypatch):
+    emitted = []
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def get(self, url, headers):
+            return _Response(503, text="upstream unavailable")
+
+    monkeypatch.setattr(mps_client_module.httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        mps_client_module,
+        "log_failure",
+        lambda failure, **context: emitted.append((failure, context)),
+    )
+
+    with pytest.raises(MPSUnavailableError) as exc_info:
+        MPSServiceKeyClient().validate_service_key(
+            "mps_sk_secret",
+            organization_id=42,
+            created_by="provider-123",
+        )
+
+    assert exc_info.value.status_code == 503
+    assert len(emitted) == 1
+    failure, context = emitted[0]
+    assert failure.type == ErrorType.SYSTEM_ERROR
+    assert failure.code == "dograh-503"
+    assert failure.provider == "dograh"
+    assert failure.error_owner.value == "operator"
+    assert "mps_sk_secret" not in failure.internal_message
+    assert context == {
+        "organization_id": 42,
+        "operation": "validate_service_key",
+    }
+
+
+def test_validate_service_key_classifies_mps_connection_failure(monkeypatch):
+    emitted = []
+    request_error = httpx.ConnectError(
+        "All connection attempts failed",
+        request=httpx.Request("GET", "https://services.dograh.com"),
+    )
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return None
+
+        def get(self, url, headers):
+            raise request_error
+
+    monkeypatch.setattr(mps_client_module.httpx, "Client", FakeClient)
+    monkeypatch.setattr(
+        mps_client_module,
+        "log_failure",
+        lambda failure, **context: emitted.append((failure, context)),
+    )
+
+    with pytest.raises(MPSUnavailableError) as exc_info:
+        MPSServiceKeyClient().validate_service_key(
+            "mps_sk_secret",
+            organization_id=42,
+        )
+
+    assert exc_info.value.__cause__ is request_error
+    assert len(emitted) == 1
+    failure, context = emitted[0]
+    assert failure.type == ErrorType.SYSTEM_ERROR
+    assert failure.code == "dograh-connection"
+    assert failure.retryable is True
+    assert context == {
+        "organization_id": 42,
+        "operation": "validate_service_key",
+    }
+
+
+@pytest.mark.asyncio
+async def test_pricing_and_voice_failures_each_emit_one_classified_record(monkeypatch):
+    emitted = []
+    responses = [_Response(502), _Response(503)]
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, headers, params=None):
+            return responses.pop(0)
+
+    monkeypatch.setattr(mps_client_module, "DEPLOYMENT_MODE", "saas")
+    monkeypatch.setattr(mps_client_module.httpx, "AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(
+        mps_client_module,
+        "log_failure",
+        lambda failure, **context: emitted.append((failure, context)),
+    )
+    client = MPSServiceKeyClient()
+
+    with pytest.raises(MPSUnavailableError):
+        await client.get_billing_pricing(42)
+    with pytest.raises(MPSUnavailableError):
+        await client.get_voices(provider="cartesia", organization_id=42)
+
+    assert len(emitted) == 2
+    pricing_failure, pricing_context = emitted[0]
+    voice_failure, voice_context = emitted[1]
+    assert pricing_failure.code == "dograh-502"
+    assert pricing_context == {
+        "organization_id": 42,
+        "operation": "get_billing_pricing",
+    }
+    assert voice_failure.code == "dograh-503"
+    assert voice_context == {
+        "organization_id": 42,
+        "operation": "get_voices",
+        "requested_provider": "cartesia",
+    }
+
+
+@pytest.mark.asyncio
+async def test_check_service_key_usage_uses_bearer_self_usage(monkeypatch):
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, headers):
+            calls.append(("GET", url, headers))
+            return _Response(
+                200,
+                {"total_credits_used": 12.5, "remaining_credits": 87.5},
+            )
+
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.httpx.AsyncClient", FakeAsyncClient
+    )
+
+    client = MPSServiceKeyClient()
+
+    assert await client.check_service_key_usage("mps_sk_paid") == {
+        "total_credits_used": 12.5,
+        "remaining_credits": 87.5,
+    }
+    assert calls[0] == (
+        "GET",
+        f"{client.base_url}/api/v1/service-keys/usage/self",
+        {
+            "Authorization": "Bearer mps_sk_paid",
+            "Content-Type": "application/json",
+        },
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_correlation_id_uses_bearer_auth(monkeypatch):
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json, headers):
+            calls.append(("POST", url, json, headers))
+            return _Response(200, {"correlation_id": "mps-corr-123"})
+
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.httpx.AsyncClient", FakeAsyncClient
+    )
+
+    client = MPSServiceKeyClient()
+
+    assert await client.create_correlation_id(
+        service_key="mps_sk_paid",
+        workflow_run_id=42,
+    ) == {"correlation_id": "mps-corr-123"}
+    assert calls == [
+        (
+            "POST",
+            f"{client.base_url}/api/v1/service-keys/correlation-id/self",
+            {"workflow_run_id": 42},
+            {
+                "Authorization": "Bearer mps_sk_paid",
+                "Content-Type": "application/json",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_authorize_workflow_run_start_uses_hosted_org_auth(monkeypatch):
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json, headers):
+            calls.append(("POST", url, json, headers))
+            return _Response(
+                200,
+                {
+                    "allowed": True,
+                    "billing_mode": "v2",
+                    "remaining_credits": "25.0000",
+                    "correlation_id": "mps-corr-123",
+                },
+            )
+
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.httpx.AsyncClient", FakeAsyncClient
+    )
+    monkeypatch.setattr("api.services.mps_service_key_client.DEPLOYMENT_MODE", "saas")
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.DOGRAH_MPS_SECRET_KEY", "mps-secret"
+    )
+
+    client = MPSServiceKeyClient()
+
+    assert await client.authorize_workflow_run_start(
+        organization_id=42,
+        workflow_run_id=88,
+        service_key="mps_sk_paid",
+        require_correlation_id=True,
+        minimum_credits=0.1,
+        metadata={"workflow_id": 7},
+        created_by="provider-123",
+    ) == {
+        "allowed": True,
+        "billing_mode": "v2",
+        "remaining_credits": "25.0000",
+        "correlation_id": "mps-corr-123",
+    }
+    assert calls == [
+        (
+            "POST",
+            f"{client.base_url}/api/v1/billing/accounts/42/run-authorization",
+            {
+                "workflow_run_id": 88,
+                "service_key": "mps_sk_paid",
+                "require_correlation_id": True,
+                "minimum_credits": 0.1,
+                "metadata": {"workflow_id": 7},
+            },
+            {
+                "Content-Type": "application/json",
+                "X-Secret-Key": "mps-secret",
+                "X-Organization-Id": "42",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_authorize_service_key_run_start_uses_bearer_auth(monkeypatch):
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json, headers):
+            calls.append(("POST", url, json, headers))
+            return _Response(
+                200,
+                {
+                    "allowed": True,
+                    "remaining_credits": "25.0000",
+                    "correlation_id": "mps-corr-123",
+                },
+            )
+
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.httpx.AsyncClient", FakeAsyncClient
+    )
+
+    client = MPSServiceKeyClient()
+
+    assert await client.authorize_service_key_run_start(
+        service_key="mps_sk_paid",
+        workflow_run_id=88,
+        require_correlation_id=True,
+        minimum_credits=0.1,
+        metadata={"workflow_id": 7},
+    ) == {
+        "allowed": True,
+        "remaining_credits": "25.0000",
+        "correlation_id": "mps-corr-123",
+    }
+    assert calls == [
+        (
+            "POST",
+            f"{client.base_url}/api/v1/service-keys/run-authorization/self",
+            {
+                "workflow_run_id": 88,
+                "require_correlation_id": True,
+                "minimum_credits": 0.1,
+                "metadata": {"workflow_id": 7},
+            },
+            {
+                "Authorization": "Bearer mps_sk_paid",
+                "Content-Type": "application/json",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_ensure_billing_account_v2_uses_balance_endpoint(monkeypatch):
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, headers):
+            calls.append(("GET", url, headers))
+            return _Response(
+                200,
+                {
+                    "id": 7,
+                    "organization_id": 42,
+                    "billing_mode": "v2",
+                    "cached_balance_credits": "0.0000",
+                    "currency": "USD",
+                },
+            )
+
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.httpx.AsyncClient", FakeAsyncClient
+    )
+    monkeypatch.setattr("api.services.mps_service_key_client.DEPLOYMENT_MODE", "saas")
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.DOGRAH_MPS_SECRET_KEY", "mps-secret"
+    )
+
+    client = MPSServiceKeyClient()
+
+    assert await client.ensure_billing_account_v2(
+        organization_id=42,
+        created_by="provider-123",
+    ) == {
+        "id": 7,
+        "organization_id": 42,
+        "billing_mode": "v2",
+        "cached_balance_credits": "0.0000",
+        "currency": "USD",
+    }
+    assert calls == [
+        (
+            "GET",
+            f"{client.base_url}/api/v1/billing/accounts/42/balance",
+            {
+                "Content-Type": "application/json",
+                "X-Secret-Key": "mps-secret",
+                "X-Organization-Id": "42",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_billing_pricing_uses_hosted_organization_auth(monkeypatch):
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, headers):
+            calls.append(("GET", url, headers))
+            return _Response(
+                200,
+                {
+                    "organization_id": 42,
+                    "platform_usage": {"price_per_minute": 0.01},
+                    "dograh_model": {"price_per_minute": 0.07},
+                },
+            )
+
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.httpx.AsyncClient", FakeAsyncClient
+    )
+    monkeypatch.setattr("api.services.mps_service_key_client.DEPLOYMENT_MODE", "saas")
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.DOGRAH_MPS_SECRET_KEY", "mps-secret"
+    )
+
+    client = MPSServiceKeyClient()
+
+    assert await client.get_billing_pricing(42) == {
+        "organization_id": 42,
+        "platform_usage": {"price_per_minute": 0.01},
+        "dograh_model": {"price_per_minute": 0.07},
+    }
+    assert calls == [
+        (
+            "GET",
+            f"{client.base_url}/api/v1/billing/accounts/42/pricing",
+            {
+                "Content-Type": "application/json",
+                "X-Secret-Key": "mps-secret",
+                "X-Organization-Id": "42",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_get_credit_ledger_sends_page_and_limit(monkeypatch):
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, params, headers):
+            calls.append(("GET", url, params, headers))
+            return _Response(
+                200,
+                {
+                    "account": {"organization_id": 42},
+                    "ledger_entries": [],
+                    "total_count": 0,
+                    "page": 3,
+                    "limit": 25,
+                    "total_pages": 0,
+                },
+            )
+
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.httpx.AsyncClient", FakeAsyncClient
+    )
+    monkeypatch.setattr("api.services.mps_service_key_client.DEPLOYMENT_MODE", "saas")
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.DOGRAH_MPS_SECRET_KEY", "mps-secret"
+    )
+
+    client = MPSServiceKeyClient()
+
+    assert await client.get_credit_ledger(
+        organization_id=42,
+        page=3,
+        limit=25,
+    ) == {
+        "account": {"organization_id": 42},
+        "ledger_entries": [],
+        "total_count": 0,
+        "page": 3,
+        "limit": 25,
+        "total_pages": 0,
+    }
+    assert calls == [
+        (
+            "GET",
+            f"{client.base_url}/api/v1/billing/accounts/42/ledger",
+            {"page": 3, "limit": 25},
+            {
+                "Content-Type": "application/json",
+                "X-Secret-Key": "mps-secret",
+                "X-Organization-Id": "42",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_report_platform_usage_uses_hosted_secret_auth(monkeypatch):
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json, headers):
+            calls.append(("POST", url, json, headers))
+            return _Response(200, {"metered": True})
+
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.httpx.AsyncClient", FakeAsyncClient
+    )
+    monkeypatch.setattr("api.services.mps_service_key_client.DEPLOYMENT_MODE", "saas")
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.DOGRAH_MPS_SECRET_KEY", "mps-secret"
+    )
+
+    client = MPSServiceKeyClient()
+
+    assert await client.report_platform_usage(
+        organization_id=42,
+        correlation_id="mps-corr-123",
+        workflow_run_id=123,
+        metadata={"source": "workflow_run_completion"},
+    ) == {"metered": True}
+    assert calls == [
+        (
+            "POST",
+            f"{client.base_url}/api/v1/billing/accounts/42/platform-usage",
+            {
+                "correlation_id": "mps-corr-123",
+                "workflow_run_id": 123,
+                "metadata": {"source": "workflow_run_completion"},
+            },
+            {
+                "Content-Type": "application/json",
+                "X-Secret-Key": "mps-secret",
+                "X-Organization-Id": "42",
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_report_platform_usage_sends_duration_without_correlation(monkeypatch):
+    calls = []
+
+    class FakeAsyncClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def post(self, url, json, headers):
+            calls.append(("POST", url, json, headers))
+            return _Response(200, {"metered": True})
+
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.httpx.AsyncClient", FakeAsyncClient
+    )
+    monkeypatch.setattr("api.services.mps_service_key_client.DEPLOYMENT_MODE", "saas")
+    monkeypatch.setattr(
+        "api.services.mps_service_key_client.DOGRAH_MPS_SECRET_KEY", "mps-secret"
+    )
+
+    client = MPSServiceKeyClient()
+
+    assert await client.report_platform_usage(
+        organization_id=42,
+        duration_seconds=87.0,
+        workflow_run_id=123,
+        metadata={"source": "workflow_run_completion"},
+    ) == {"metered": True}
+    assert calls == [
+        (
+            "POST",
+            f"{client.base_url}/api/v1/billing/accounts/42/platform-usage",
+            {
+                "duration_seconds": 87.0,
+                "workflow_run_id": 123,
+                "metadata": {"source": "workflow_run_completion"},
+            },
+            {
+                "Content-Type": "application/json",
+                "X-Secret-Key": "mps-secret",
+                "X-Organization-Id": "42",
+            },
+        )
+    ]

@@ -1,0 +1,879 @@
+"""WebSocket-based WebRTC signaling endpoint with ICE trickling support.
+
+This implementation uses WebSocket-based signaling instead of HTTP PATCH for ICE candidates,
+which is suitable for multi-worker FastAPI deployments where local _pcs_map cannot be shared.
+
+Uses the SmallWebRTC API contract:
+- SmallWebRTCConnection for peer connection management
+- candidate_from_sdp() for parsing ICE candidates
+- add_ice_candidate() for trickling support
+
+TURN Authentication:
+- Uses time-limited credentials (TURN REST API) when TURN_SECRET is configured
+- Credentials are generated per-connection using HMAC-SHA1
+- Falls back to static credentials if TURN_SECRET is not set (legacy mode)
+"""
+
+import asyncio
+import ipaddress
+import os
+from datetime import UTC, datetime
+from enum import Enum
+from typing import Dict, List, Optional, Set
+
+from aiortc import RTCIceServer
+from aiortc.sdp import candidate_from_sdp
+from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect
+from loguru import logger
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.utils.run_context import set_current_org_id, set_current_run_id
+from starlette.websockets import WebSocketState
+
+from api.constants import ENABLE_COTURN, ENVIRONMENT, FORCE_TURN_RELAY, SERVER_IP
+from api.db import db_client
+from api.db.models import UserModel
+from api.enums import Environment, WorkflowRunMode
+from api.routes.turn_credentials import (
+    TURN_HOST,
+    TURN_PORT,
+    TURN_SECRET,
+    generate_turn_credentials,
+)
+from api.services.auth.depends import get_user_ws
+from api.services.call_concurrency import (
+    CallConcurrencyLimitError,
+    WorkflowRunSlotAlreadyBoundError,
+    call_concurrency,
+)
+from api.services.pipecat.run_pipeline import run_pipeline_smallwebrtc
+from api.services.pipecat.ws_sender_registry import (
+    register_ws_sender,
+    unregister_ws_sender,
+)
+from api.services.quota_service import authorize_workflow_run_start
+from api.services.workflow.embed_session_service import validate_embed_origin
+
+router = APIRouter(prefix="/ws")
+
+
+class NonRelayFilterPolicy(Enum):
+    """What to filter from non-relay ICE candidates. Relay candidates always pass."""
+
+    NONE = "none"  # filter nothing — pass all candidates
+    PRIVATE = "private"  # filter non-relay candidates with private/CGNAT IPs
+    PUBLIC = "public"  # filter non-relay candidates that are NOT private/CGNAT
+    ALL = "all"  # filter all non-relay candidates (relay-only mode)
+
+
+def is_cgnat_ip(ip_str: str) -> bool:
+    """Return True for CGNAT addresses (100.64.0.0/10) specifically — the
+    range Tailscale and similar overlay networks use. Distinct from the
+    broader is_local_or_cgnat_ip(): a CGNAT-addressed server (e.g. Tailscale-
+    only, no public IP) commonly has no route to the public internet at all,
+    whereas a plain RFC1918 LAN server usually still has normal NAT'd
+    internet access — the two need different inbound-candidate handling.
+    """
+
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+
+    return ip.version == 4 and ip in ipaddress.ip_network("100.64.0.0/10")
+
+
+def is_local_or_cgnat_ip(ip_str: str) -> bool:
+    """Return True for RFC1918, loopback, link-local, and CGNAT addresses."""
+
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+
+    return ip.is_private or ip.is_loopback or ip.is_link_local or is_cgnat_ip(ip_str)
+
+
+def resolve_ice_filter_policies(
+    environment: str,
+    force_turn_relay: bool,
+    server_ip: str,
+) -> tuple[NonRelayFilterPolicy, NonRelayFilterPolicy]:
+    """Resolve outbound and inbound non-relay filtering for this deployment."""
+
+    private_lan_deployment = (
+        environment != Environment.LOCAL.value and is_local_or_cgnat_ip(server_ip)
+    )
+
+    if force_turn_relay:
+        # Relay-only diagnostics stay explicit. On private LAN deployments we
+        # must still accept inbound private candidates for relay<->host pairs.
+        outbound_policy = NonRelayFilterPolicy.ALL
+        if private_lan_deployment:
+            # A CGNAT-addressed server (e.g. Tailscale-only, no public IP)
+            # commonly has no route to the public internet at all, so a
+            # genuinely public inbound candidate can never be reachable once
+            # we've committed to relay-only — e.g. a client-side STUN entry
+            # leaking a server-reflexive public-IP candidate despite
+            # iceTransportPolicy: 'relay'. Drop those instead of wasting the
+            # ICE timeout on a doomed direct-to-internet check.
+            #
+            # A plain RFC1918 LAN server usually still has normal NAT'd
+            # internet access, so a public candidate there might genuinely
+            # succeed — keep accepting everything inbound as before.
+            inbound_policy = (
+                NonRelayFilterPolicy.PUBLIC
+                if is_cgnat_ip(server_ip)
+                else NonRelayFilterPolicy.NONE
+            )
+        else:
+            inbound_policy = NonRelayFilterPolicy.PRIVATE
+        return outbound_policy, inbound_policy
+
+    if environment == Environment.LOCAL.value or private_lan_deployment:
+        return NonRelayFilterPolicy.NONE, NonRelayFilterPolicy.NONE
+
+    # Public remote deployment: drop private-IP host candidates to avoid
+    # coturn denied-peer-ip errors against Docker bridge and LAN interfaces.
+    return NonRelayFilterPolicy.PRIVATE, NonRelayFilterPolicy.PRIVATE
+
+
+ICE_OUTBOUND_POLICY, ICE_INBOUND_POLICY = resolve_ice_filter_policies(
+    ENVIRONMENT,
+    FORCE_TURN_RELAY,
+    SERVER_IP,
+)
+
+
+def is_private_ip_candidate(candidate_str: str) -> bool:
+    """Check if ICE candidate contains a private IP address or CGNAT IP Address.
+
+    Parses the candidate string to extract the IP address and checks if it's private.
+    This is used to filter out host candidates with private IPs in non-local environments,
+    preventing TURN relay errors when coturn blocks private IP ranges or CGNAT IP Addresses.
+
+    Args:
+        candidate_str: ICE candidate string, e.g.,
+            "candidate:123 1 udp 2122260223 192.168.50.24 63603 typ host ..."
+
+    Returns:
+        True if the candidate contains a private IP, False otherwise.
+    """
+    try:
+        parts = candidate_str.split()
+        # Find "typ" and get the IP which is 2 positions before it
+        if "typ" in parts:
+            typ_index = parts.index("typ")
+            ip_str = parts[typ_index - 2]
+            return is_local_or_cgnat_ip(ip_str)
+    except (ValueError, IndexError):
+        pass
+    return False
+
+
+def _keep_candidate(candidate_str: str, policy: NonRelayFilterPolicy) -> bool:
+    """Return True if this ICE candidate should be kept under the given policy.
+
+    Relay candidates always pass — a relay with a private IP (LAN TURN server)
+    must never be dropped regardless of policy.
+    """
+    if " typ relay" in candidate_str:
+        return True
+    if policy == NonRelayFilterPolicy.NONE:
+        return True
+    if policy == NonRelayFilterPolicy.ALL:
+        return False
+    if policy == NonRelayFilterPolicy.PUBLIC:
+        # PUBLIC: drop non-relay candidates that are NOT private/CGNAT
+        return is_private_ip_candidate(candidate_str)
+    # PRIVATE: drop non-relay candidates with private/CGNAT IPs
+    return not is_private_ip_candidate(candidate_str)
+
+
+def filter_outbound_sdp(sdp: str) -> str:
+    """Strip ICE candidates from an outbound answer SDP based on ICE_OUTBOUND_POLICY."""
+    if ICE_OUTBOUND_POLICY == NonRelayFilterPolicy.NONE:
+        return sdp
+
+    lines = sdp.split("\r\n")
+    filtered: List[str] = []
+    dropped = 0
+    kept_relay = 0
+    for line in lines:
+        if line.startswith("a=candidate:"):
+            candidate_str = line[2:]
+            if not _keep_candidate(candidate_str, ICE_OUTBOUND_POLICY):
+                dropped += 1
+                continue
+            if " typ relay" in candidate_str:
+                kept_relay += 1
+        filtered.append(line)
+
+    if ICE_OUTBOUND_POLICY == NonRelayFilterPolicy.ALL:
+        if kept_relay == 0:
+            logger.warning(
+                "FORCE_TURN_RELAY is on but the answer SDP has no relay candidates "
+                f"(dropped {dropped} non-relay). TURN may be unreachable; "
+                "the connection will fail."
+            )
+        else:
+            logger.info(
+                f"FORCE_TURN_RELAY: kept {kept_relay} relay candidates, "
+                f"dropped {dropped} non-relay"
+            )
+
+    return "\r\n".join(filtered)
+
+
+def get_ice_servers(user_id: Optional[str] = None) -> List[RTCIceServer]:
+    """Build ICE servers configuration including TURN if configured.
+
+    Args:
+        user_id: Optional user ID for generating time-limited TURN credentials.
+                 If provided and TURN_SECRET is configured, uses TURN REST API.
+
+    Returns:
+        List of RTCIceServer configurations for WebRTC peer connection.
+    """
+    # A `stun:` entry can only yield srflx, never relay, so it cannot help a
+    # relay-only connection — it only gathers a public IP that
+    # filter_outbound_sdp() strips back out. Matches the client-side skip.
+    servers: List[RTCIceServer] = (
+        [] if FORCE_TURN_RELAY else [RTCIceServer(urls="stun:stun.l.google.com:19302")]
+    )
+
+    # Check if TURN is configured. ENABLE_COTURN is the deployment's declared
+    # answer to "is there a TURN server?" — the same flag /health advertises to
+    # browsers — so the server side must respect it too, or it would try to
+    # relay through a TURN server the deployment says it doesn't have.
+    if not ENABLE_COTURN or not TURN_HOST:
+        if FORCE_TURN_RELAY:
+            # Fail loudly rather than silently degrading to STUN: relay-only was
+            # requested precisely because direct connectivity is known not to
+            # work, so an empty server list producing zero candidates is the
+            # honest outcome — but it needs to be diagnosable.
+            logger.error(
+                "FORCE_TURN_RELAY is on but no TURN server is configured "
+                f"(ENABLE_COTURN={ENABLE_COTURN}, TURN_HOST={TURN_HOST!r}). "
+                "Relay-only connections cannot succeed until TURN is configured."
+            )
+        return servers
+
+    # Use time-limited credentials if TURN_SECRET is configured (recommended)
+    if TURN_SECRET and user_id:
+        try:
+            credentials = generate_turn_credentials(user_id)
+            servers.append(
+                RTCIceServer(
+                    urls=credentials["uris"],
+                    username=credentials["username"],
+                    credential=credentials["password"],
+                )
+            )
+            logger.info(
+                f"TURN server configured with time-limited credentials, TTL: {credentials['ttl']}s"
+            )
+            return servers
+        except Exception as e:
+            logger.error(f"Failed to generate TURN credentials: {e}")
+
+    # Fallback to static credentials (legacy mode - not recommended for production)
+    turn_username = os.getenv("TURN_USERNAME")
+    turn_password = os.getenv("TURN_PASSWORD")
+
+    if turn_username and turn_password:
+        servers.append(
+            RTCIceServer(
+                urls=[
+                    f"turn:{TURN_HOST}:{TURN_PORT}",
+                    f"turn:{TURN_HOST}:{TURN_PORT}?transport=tcp",
+                ],
+                username=turn_username,
+                credential=turn_password,
+            )
+        )
+        logger.warning(
+            f"TURN server configured with static credentials (consider using TURN_SECRET for time-limited auth)"
+        )
+
+    return servers
+
+
+class SignalingManager:
+    """Manages WebSocket connections and WebRTC peer connections."""
+
+    def __init__(self):
+        self._connections: Dict[str, WebSocket] = {}
+        self._peer_connections: Dict[str, SmallWebRTCConnection] = {}
+        self._connection_peer_ids: Dict[str, Set[str]] = {}
+        self._peer_connection_owners: Dict[str, str] = {}
+
+    def _track_peer_connection(
+        self, connection_id: str, pc_id: str, pc: SmallWebRTCConnection
+    ) -> None:
+        self._peer_connections[pc_id] = pc
+        self._peer_connection_owners[pc_id] = connection_id
+        self._connection_peer_ids.setdefault(connection_id, set()).add(pc_id)
+
+    def _forget_peer_connection(self, pc_id: str) -> Optional[str]:
+        connection_id = self._peer_connection_owners.pop(pc_id, None)
+        self._peer_connections.pop(pc_id, None)
+
+        if connection_id:
+            peer_ids = self._connection_peer_ids.get(connection_id)
+            if peer_ids is not None:
+                peer_ids.discard(pc_id)
+                if not peer_ids:
+                    self._connection_peer_ids.pop(connection_id, None)
+
+        return connection_id
+
+    async def _send_json_if_connected(
+        self, websocket: WebSocket, message: dict
+    ) -> bool:
+        if websocket.application_state != WebSocketState.CONNECTED:
+            return False
+
+        try:
+            await websocket.send_json(message)
+            return True
+        except Exception as e:
+            logger.debug(f"Failed to send signaling WebSocket message: {e}")
+            return False
+
+    async def _close_websocket_if_connected(
+        self, websocket: WebSocket, code: int = 1000, reason: str = ""
+    ) -> None:
+        if websocket.application_state != WebSocketState.CONNECTED:
+            return
+
+        try:
+            await websocket.close(code=code, reason=reason)
+        except Exception as e:
+            logger.debug(f"Failed to close signaling WebSocket: {e}")
+
+    async def _notify_call_ended_and_close_websocket(
+        self,
+        websocket: WebSocket,
+        workflow_run_id: int,
+        pc_id: str,
+        reason: str,
+    ) -> None:
+        await self._send_json_if_connected(
+            websocket,
+            {
+                "type": "call-ended",
+                "payload": {
+                    "workflow_run_id": workflow_run_id,
+                    "pc_id": pc_id,
+                    "reason": reason,
+                },
+            },
+        )
+        await self._close_websocket_if_connected(
+            websocket, code=1000, reason="call ended"
+        )
+
+    async def handle_websocket(
+        self,
+        websocket: WebSocket,
+        workflow_id: int,
+        workflow_run_id: int,
+        user: UserModel,
+        organization_id: int,
+        enforce_call_concurrency: bool = False,
+        call_concurrency_source: str = "webrtc",
+        allow_client_context_vars: bool = True,
+    ):
+        """Handle WebSocket connection for signaling."""
+        await websocket.accept()
+        connection_id = f"{workflow_id}:{workflow_run_id}:{user.id}"
+        connection_key = f"{connection_id}:{id(websocket)}"
+        self._connections[connection_key] = websocket
+
+        try:
+            while True:
+                message = await websocket.receive_json()
+                await self._handle_message(
+                    websocket,
+                    message,
+                    workflow_id,
+                    workflow_run_id,
+                    user,
+                    organization_id,
+                    connection_key,
+                    enforce_call_concurrency,
+                    call_concurrency_source,
+                    allow_client_context_vars,
+                )
+        except WebSocketDisconnect:
+            logger.info(f"WebSocket disconnected for {connection_id}")
+        except Exception as e:
+            if websocket.application_state == WebSocketState.DISCONNECTED:
+                logger.info(f"WebSocket disconnected for {connection_id}")
+            else:
+                logger.error(f"WebSocket error for {connection_id}: {e}")
+        finally:
+            # Cleanup
+            self._connections.pop(connection_key, None)
+            peer_ids = list(self._connection_peer_ids.pop(connection_key, set()))
+
+            # Unregister WebSocket sender for real-time feedback
+            unregister_ws_sender(workflow_run_id)
+
+            # Clean up peer connections owned by this WebSocket.
+            # Note: In a WebSocket-based signaling approach (vs HTTP PATCH),
+            # we maintain our own connection map instead of relying on
+            # SmallWebRTCRequestHandler's _pcs_map. This is suitable for
+            # multi-worker FastAPI deployments where state cannot be shared.
+            for pc_id in peer_ids:
+                self._peer_connection_owners.pop(pc_id, None)
+                pc = self._peer_connections.pop(pc_id, None)
+                if pc:
+                    try:
+                        await pc.disconnect()
+                        logger.debug(f"Disconnected peer connection: {pc_id}")
+                    except Exception as e:
+                        logger.debug(
+                            f"Failed to disconnect peer connection {pc_id}: {e}"
+                        )
+
+    async def _handle_message(
+        self,
+        ws: WebSocket,
+        message: dict,
+        workflow_id: int,
+        workflow_run_id: int,
+        user: UserModel,
+        organization_id: int,
+        connection_key: str,
+        enforce_call_concurrency: bool,
+        call_concurrency_source: str = "webrtc",
+        allow_client_context_vars: bool = True,
+    ):
+        """Handle incoming WebSocket messages."""
+        msg_type = message.get("type")
+        payload = message.get("payload", {})
+
+        if msg_type == "offer":
+            await self._handle_offer(
+                ws,
+                payload,
+                workflow_id,
+                workflow_run_id,
+                user,
+                organization_id,
+                connection_key,
+                enforce_call_concurrency,
+                call_concurrency_source,
+                allow_client_context_vars,
+            )
+        elif msg_type == "ice-candidate":
+            await self._handle_ice_candidate(payload, connection_key)
+        elif msg_type == "renegotiate":
+            await self._handle_renegotiation(ws, payload, connection_key)
+
+    async def _handle_offer(
+        self,
+        ws: WebSocket,
+        payload: dict,
+        workflow_id: int,
+        workflow_run_id: int,
+        user: UserModel,
+        organization_id: int,
+        connection_key: str,
+        enforce_call_concurrency: bool,
+        call_concurrency_source: str = "webrtc",
+        allow_client_context_vars: bool = True,
+    ):
+        """Handle offer message and create answer with ICE trickling."""
+        pc_id = payload.get("pc_id")
+        sdp = payload.get("sdp")
+        type_ = payload.get("type")
+        call_context_vars = (
+            payload.get("call_context_vars", {}) if allow_client_context_vars else {}
+        )
+
+        if not pc_id or not sdp or not type_:
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "payload": {"message": "Missing offer fields"},
+                }
+            )
+            return
+
+        # Set run context for logging and tracing. org_id must be set before
+        # pc.initialize() so that aiortc's internal tasks inherit it.
+        set_current_run_id(workflow_run_id)
+        set_current_org_id(organization_id)
+
+        # Check Dograh quota before initiating the call (apply per-workflow
+        # model_overrides so we evaluate the keys this workflow will use).
+        quota_result = await authorize_workflow_run_start(
+            workflow_id=workflow_id,
+            organization_id=organization_id,
+            workflow_run_id=workflow_run_id,
+            actor_user=user,
+        )
+        if not quota_result.has_quota:
+            # Send error response for quota issues
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "payload": {
+                        "error_type": quota_result.error_code,
+                        "message": quota_result.error_message,
+                    },
+                }
+            )
+            return
+
+        if pc_id in self._peer_connections:
+            if self._peer_connection_owners.get(pc_id) != connection_key:
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "payload": {"message": "Peer connection already owned"},
+                    }
+                )
+                return
+
+            # Reuse existing connection
+            logger.info(f"Reusing existing connection for pc_id: {pc_id}")
+            pc = self._peer_connections[pc_id]
+            await pc.renegotiate(sdp=sdp, type=type_, restart_pc=False)
+
+            # Send updated answer
+            answer = pc.get_answer()
+            await ws.send_json(
+                {
+                    "type": "answer",
+                    "payload": {
+                        "sdp": filter_outbound_sdp(answer["sdp"]),
+                        "type": "answer",
+                        "pc_id": pc_id,
+                    },
+                }
+            )
+        else:
+            concurrency_slot = None
+            concurrency_bound = False
+            pipeline_started = False
+            pc = None
+            if enforce_call_concurrency:
+                try:
+                    concurrency_slot = await call_concurrency.acquire_org_slot(
+                        organization_id,
+                        source=call_concurrency_source,
+                        timeout=0,
+                    )
+                    await call_concurrency.bind_workflow_run(
+                        concurrency_slot,
+                        workflow_run_id,
+                    )
+                    concurrency_bound = True
+                except CallConcurrencyLimitError:
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "payload": {
+                                "error_type": "concurrency_limit_exceeded",
+                                "message": "Concurrent call limit reached",
+                            },
+                        }
+                    )
+                    return
+                except WorkflowRunSlotAlreadyBoundError:
+                    await ws.send_json(
+                        {
+                            "type": "error",
+                            "payload": {
+                                "error_type": "workflow_run_already_active",
+                                "message": "Workflow run already has an active call",
+                            },
+                        }
+                    )
+                    return
+
+            # Create new connection using correct SmallWebRTC API
+            # Generate ICE servers with time-limited TURN credentials for this user
+            try:
+                user_ice_servers = get_ice_servers(user_id=str(user.id))
+                pc = SmallWebRTCConnection(
+                    ice_servers=user_ice_servers, connection_timeout_secs=60
+                )
+                # Set the pc_id before initialization so it's available in get_answer()
+                pc._pc_id = pc_id
+
+                # Initialize connection with offer
+                await pc.initialize(sdp=sdp, type=type_)
+
+                # Store peer connection using client's pc_id
+                self._track_peer_connection(connection_key, pc_id, pc)
+
+                # Register WebSocket sender for real-time feedback
+                async def ws_sender(message: dict):
+                    if ws.application_state == WebSocketState.CONNECTED:
+                        await ws.send_json(message)
+
+                register_ws_sender(workflow_run_id, ws_sender)
+
+                # Setup closed handler
+                @pc.event_handler("closed")
+                async def handle_disconnected(
+                    webrtc_connection: SmallWebRTCConnection,
+                ):
+                    logger.info(f"PeerConnection closed: {webrtc_connection.pc_id}")
+                    owner_connection_id = self._forget_peer_connection(
+                        webrtc_connection.pc_id
+                    )
+                    if owner_connection_id == connection_key:
+                        await self._notify_call_ended_and_close_websocket(
+                            ws,
+                            workflow_run_id,
+                            webrtc_connection.pc_id,
+                            reason="peer_connection_closed",
+                        )
+
+                # Start pipeline in background
+                asyncio.create_task(
+                    run_pipeline_smallwebrtc(
+                        pc,
+                        workflow_id,
+                        workflow_run_id,
+                        user.id,
+                        call_context_vars,
+                        user_provider_id=str(user.provider_id),
+                        organization_id=organization_id,
+                    )
+                )
+                pipeline_started = True
+
+                # Get answer after initialization
+                answer = pc.get_answer()
+
+                # Send answer immediately (ICE candidates will be sent separately via trickling)
+                await ws.send_json(
+                    {
+                        "type": "answer",
+                        "payload": {
+                            "sdp": filter_outbound_sdp(answer["sdp"]),
+                            "type": answer["type"],
+                            "pc_id": answer["pc_id"],
+                        },
+                    }
+                )
+            except Exception:
+                if pipeline_started and pc is not None:
+                    try:
+                        await pc.disconnect()
+                    except Exception as e:
+                        logger.debug(f"Failed to disconnect failed offer pc: {e}")
+                elif concurrency_bound:
+                    await call_concurrency.release_workflow_run_slot(workflow_run_id)
+                elif concurrency_slot is not None:
+                    await call_concurrency.release_slot(concurrency_slot)
+                raise
+
+    async def _handle_ice_candidate(self, payload: dict, connection_key: str):
+        """Handle incoming ICE candidate from client.
+
+        Uses SmallWebRTC's native ICE trickling support via add_ice_candidate().
+        Candidates are parsed using aiortc's candidate_from_sdp() for proper formatting,
+        consistent with SmallWebRTCRequestHandler.handle_patch_request().
+        Candidates are filtered according to ICE_INBOUND_POLICY before being added.
+        """
+        pc_id = payload.get("pc_id")
+        candidate_data = payload.get("candidate")
+
+        if not pc_id:
+            logger.warning("Received ICE candidate without pc_id")
+            return
+
+        pc = self._peer_connections.get(pc_id)
+        if not pc:
+            logger.warning(f"No peer connection found for pc_id: {pc_id}")
+            return
+        if self._peer_connection_owners.get(pc_id) != connection_key:
+            logger.warning(f"Ignoring ICE candidate for unowned pc_id: {pc_id}")
+            return
+
+        if candidate_data:
+            candidate_str = candidate_data.get("candidate", "")
+
+            if not _keep_candidate(candidate_str, ICE_INBOUND_POLICY):
+                logger.debug(
+                    f"Dropping inbound candidate per policy ({ICE_INBOUND_POLICY.value}): {candidate_str[:50]}..."
+                )
+                return
+
+            try:
+                # Parse the ICE candidate using aiortc's parser (same as SmallWebRTCRequestHandler)
+                candidate = candidate_from_sdp(candidate_str)
+                candidate.sdpMid = candidate_data.get("sdpMid")
+                candidate.sdpMLineIndex = candidate_data.get("sdpMLineIndex")
+
+                await pc.add_ice_candidate(candidate)
+                logger.debug(f"Added ICE candidate for pc_id: {pc_id}")
+            except Exception as e:
+                logger.error(f"Failed to add ICE candidate: {e}")
+        else:
+            logger.debug(f"End of ICE candidates for pc_id: {pc_id}")
+
+    async def _handle_renegotiation(
+        self, ws: WebSocket, payload: dict, connection_key: str
+    ):
+        """Handle renegotiation request."""
+        pc_id = payload.get("pc_id")
+        sdp = payload.get("sdp")
+        type_ = payload.get("type")
+        restart_pc = payload.get("restart_pc", False)
+
+        if not pc_id or pc_id not in self._peer_connections:
+            await ws.send_json(
+                {"type": "error", "payload": {"message": "Peer connection not found"}}
+            )
+            return
+        if self._peer_connection_owners.get(pc_id) != connection_key:
+            await ws.send_json(
+                {"type": "error", "payload": {"message": "Peer connection not found"}}
+            )
+            return
+
+        pc = self._peer_connections[pc_id]
+        await pc.renegotiate(sdp=sdp, type=type_, restart_pc=restart_pc)
+
+        # Send updated answer
+        answer = pc.get_answer()
+        await ws.send_json(
+            {
+                "type": "answer",
+                "payload": {
+                    "sdp": filter_outbound_sdp(answer["sdp"]),
+                    "type": "answer",
+                    "pc_id": pc_id,  # Use the client's pc_id
+                },
+            }
+        )
+
+
+# Create singleton instance
+signaling_manager = SignalingManager()
+
+
+@router.websocket("/signaling/{workflow_id}/{workflow_run_id}")
+async def signaling_websocket(
+    websocket: WebSocket,
+    workflow_id: int,
+    workflow_run_id: int,
+    user: UserModel = Depends(get_user_ws),
+):
+    """WebSocket endpoint for WebRTC signaling with ICE trickling."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+
+    workflow_run = await db_client.get_workflow_run(
+        workflow_run_id, organization_id=user.selected_organization_id
+    )
+    if not workflow_run:
+        logger.warning(
+            f"workflow run {workflow_run_id} not found for org "
+            f"{user.selected_organization_id}"
+        )
+        raise HTTPException(status_code=400, detail="Bad workflow_run_id")
+    if workflow_run.workflow_id != workflow_id:
+        logger.warning(
+            f"workflow run {workflow_run_id} belongs to workflow "
+            f"{workflow_run.workflow_id}, not {workflow_id}"
+        )
+        raise HTTPException(status_code=400, detail="workflow_run_workflow_mismatch")
+
+    await signaling_manager.handle_websocket(
+        websocket,
+        workflow_id,
+        workflow_run_id,
+        user,
+        user.selected_organization_id,
+        enforce_call_concurrency=True,
+        call_concurrency_source="webrtc",
+    )
+
+
+@router.websocket("/public/signaling/{session_token}")
+async def public_signaling_websocket(
+    websocket: WebSocket,
+    session_token: str,
+):
+    """Public WebSocket endpoint for WebRTC signaling with embed tokens.
+
+    This endpoint:
+    1. Validates the session token from embed initialization
+    2. Retrieves the associated workflow run
+    3. Handles WebRTC signaling without requiring authentication
+    """
+
+    # Validate session token
+    embed_session = await db_client.get_embed_session_by_token(session_token)
+    if not embed_session:
+        await websocket.close(code=1008, reason="Invalid session token")
+        return
+
+    # Check if session is expired
+    if embed_session.expires_at and embed_session.expires_at < datetime.now(UTC):
+        await websocket.close(code=1008, reason="Session expired")
+        return
+
+    # Get the embed token for user information
+    embed_token = await db_client.get_embed_token_by_id(embed_session.embed_token_id)
+    if not embed_token:
+        await websocket.close(code=1008, reason="Invalid embed token")
+        return
+
+    workflow_run = await db_client.get_workflow_run(
+        embed_session.workflow_run_id,
+        organization_id=embed_token.organization_id,
+    )
+    if not workflow_run:
+        await websocket.close(code=1008, reason="Invalid workflow run")
+        return
+    if workflow_run.workflow_id != embed_token.workflow_id:
+        await websocket.close(code=1008, reason="workflow_run_workflow_mismatch")
+        return
+    # A chat-widget session token must not be able to open a voice pipeline on
+    # its textchat run — chat sessions speak REST (public_embed_chat), not this.
+    if workflow_run.mode != WorkflowRunMode.SMALLWEBRTC.value:
+        await websocket.close(code=1008, reason="Not a voice session")
+        return
+
+    # Enforce the embed token's allowed-domain policy on the public signaling
+    # path, mirroring the HTTP embed endpoints (issue #330). Without this a
+    # leaked or replayed session token could attach from an arbitrary origin.
+    origin = websocket.headers.get("origin") or websocket.headers.get("referer", "")
+    if not validate_embed_origin(origin, embed_token.allowed_domains or []):
+        logger.warning(
+            f"Domain validation failed for public signaling: {origin} "
+            f"not in {embed_token.allowed_domains}"
+        )
+        await websocket.close(code=1008, reason="Domain not allowed")
+        return
+
+    # Create a minimal user object for compatibility with signaling manager
+    # Use the embed token creator as the user
+    user = await db_client.get_user_by_id(embed_token.created_by)
+    if not user:
+        await websocket.close(code=1008, reason="Invalid user")
+        return
+
+    # Handle the WebSocket connection using the existing signaling manager
+    await signaling_manager.handle_websocket(
+        websocket,
+        embed_token.workflow_id,
+        embed_session.workflow_run_id,
+        user,
+        embed_token.organization_id,
+        enforce_call_concurrency=True,
+        call_concurrency_source="public_embed",
+        # Embed context was already sanitized and persisted during /init.
+        # Never let the signaling payload overwrite server-owned run context.
+        allow_client_context_vars=False,
+    )

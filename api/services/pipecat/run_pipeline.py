@@ -1,0 +1,1340 @@
+import asyncio
+from typing import Optional
+
+from fastapi import HTTPException
+from loguru import logger
+
+from api.db import db_client
+from api.enums import WorkflowRunMode
+from api.errors.failure import mark_failure_reported
+from api.schemas.workflow_configurations import (
+    DEFAULT_MAX_CALL_DURATION_SECONDS,
+    DEFAULT_MAX_USER_IDLE_TIMEOUT_SECONDS,
+    DEFAULT_PROVISIONAL_VAD_PAUSE_SECS,
+    DEFAULT_SMART_TURN_STOP_SECS,
+    DEFAULT_TURN_START_MIN_WORDS,
+    DEFAULT_TURN_START_STRATEGY,
+)
+from api.services.call_concurrency import call_concurrency
+from api.services.configuration.registry import ServiceProviders
+from api.services.integrations import (
+    IntegrationRuntimeContext,
+    create_runtime_sessions,
+)
+from api.services.observability.active_calls import (
+    register_active_call as register_worker_active_call,
+)
+from api.services.observability.active_calls import (
+    unregister_active_call as unregister_worker_active_call,
+)
+from api.services.pipecat.audio_config import AudioConfig, create_audio_config
+from api.services.pipecat.event_handlers import (
+    register_audio_data_handler,
+    register_event_handlers,
+)
+from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
+from api.services.pipecat.pipeline_builder import (
+    build_pipeline,
+    build_realtime_pipeline,
+    create_pipeline_components,
+    create_pipeline_task,
+)
+from api.services.pipecat.pipeline_engine_callbacks_processor import (
+    PipelineEngineCallbacksProcessor,
+)
+from api.services.pipecat.pipeline_metrics_aggregator import PipelineMetricsAggregator
+from api.services.pipecat.pre_call_fetch import execute_pre_call_fetch
+from api.services.pipecat.realtime_feedback_events import (
+    build_node_transition_event,
+)
+from api.services.pipecat.realtime_feedback_observer import (
+    RealtimeFeedbackObserver,
+    register_turn_log_handlers,
+)
+from api.services.pipecat.recording_audio_cache import (
+    create_recording_audio_fetcher,
+    warm_recording_cache,
+)
+from api.services.pipecat.recording_router_processor import RecordingRouterProcessor
+from api.services.pipecat.service_factory import (
+    create_llm_service,
+    create_llm_service_from_provider,
+    create_realtime_llm_service,
+    create_stt_service,
+    create_tts_service,
+    stt_uses_external_turns,
+)
+from api.services.pipecat.tracing_config import (
+    ensure_tracing,
+)
+from api.services.pipecat.transcript_log_coordinator import TranscriptLogCoordinator
+from api.services.pipecat.transport_setup import create_webrtc_transport
+from api.services.pipecat.worker_runner import run_pipeline_worker
+from api.services.pipecat.ws_sender_registry import get_ws_sender
+from api.services.telephony import registry as telephony_registry
+from api.services.workflow.dto import ReactFlowDTO
+from api.services.workflow.initial_context import merge_external_initial_context
+from api.services.workflow.pipecat_engine import PipecatEngine
+from api.services.workflow.workflow_graph import WorkflowGraph
+from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
+from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
+from pipecat.audio.vad.silero import SileroVADAnalyzer
+from pipecat.audio.vad.vad_analyzer import VADParams
+from pipecat.extensions.voicemail.voicemail_detector import VoicemailDetector
+from pipecat.processors.aggregators.llm_response_universal import (
+    LLMAssistantAggregatorParams,
+    LLMContextAggregatorPair,
+    LLMUserAggregatorParams,
+)
+from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
+from pipecat.turns.user_mute import (
+    CallbackUserMuteStrategy,
+    FunctionCallUserMuteStrategy,
+    MuteUntilFirstBotCompleteUserMuteStrategy,
+)
+from pipecat.turns.user_start import (
+    ExternalUserTurnStartStrategy,
+    MinWordsUserTurnStartStrategy,
+    ProvisionalVADUserTurnStartStrategy,
+)
+from pipecat.turns.user_start.transcription_user_turn_start_strategy import (
+    TranscriptionUserTurnStartStrategy,
+)
+from pipecat.turns.user_start.vad_user_turn_start_strategy import (
+    VADUserTurnStartStrategy,
+)
+from pipecat.turns.user_stop import (
+    ExternalUserTurnStopStrategy,
+    SpeechTimeoutUserTurnStopStrategy,
+    TurnAnalyzerUserTurnStopStrategy,
+)
+from pipecat.turns.user_turn_strategies import UserTurnStrategies
+from pipecat.utils.enums import EndTaskReason, RealtimeFeedbackType
+from pipecat.utils.run_context import set_current_org_id, set_current_run_id
+
+# Setup tracing if enabled
+ensure_tracing()
+
+DEFAULT_USER_TURN_STOP_TIMEOUT = 5.0
+EXTERNAL_TURN_USER_STOP_TIMEOUT = 30.0
+
+
+def _resolve_user_turn_stop_timeout(
+    run_configs: dict, *, uses_external_turns: bool
+) -> float:
+    if "user_turn_stop_timeout" in run_configs:
+        return float(run_configs["user_turn_stop_timeout"])
+    if uses_external_turns:
+        return EXTERNAL_TURN_USER_STOP_TIMEOUT
+    return DEFAULT_USER_TURN_STOP_TIMEOUT
+
+
+def _resolve_turn_start_min_words(run_configs: dict) -> int:
+    return max(
+        1,
+        int(run_configs.get("turn_start_min_words", DEFAULT_TURN_START_MIN_WORDS)),
+    )
+
+
+def _resolve_provisional_vad_pause_secs(run_configs: dict) -> float:
+    return max(
+        0.1,
+        float(
+            run_configs.get(
+                "provisional_vad_pause_secs", DEFAULT_PROVISIONAL_VAD_PAUSE_SECS
+            )
+        ),
+    )
+
+
+def _create_non_realtime_user_turn_start_strategies(
+    run_configs: dict, *, uses_external_turns: bool
+):
+    """Return user turn start strategies for non-realtime pipelines."""
+
+    turn_start_strategy = run_configs.get(
+        "turn_start_strategy", DEFAULT_TURN_START_STRATEGY
+    )
+
+    # Astra WF30 staging (round 2 fix 1): word-gated barge-in, only when the workflow
+    # config enables astra_barge_in_guard; every other workflow is unchanged.
+    if not uses_external_turns:
+        from api.services.pipecat.astra_barge_in_guard import guard_from_config
+
+        _guard = guard_from_config(run_configs)
+        if _guard:
+            return _guard
+
+    if turn_start_strategy == "min_words":
+        return [
+            MinWordsUserTurnStartStrategy(
+                min_words=_resolve_turn_start_min_words(run_configs)
+            )
+        ]
+
+    if turn_start_strategy == "provisional_vad":
+        return [
+            ProvisionalVADUserTurnStartStrategy(
+                pause_secs=_resolve_provisional_vad_pause_secs(run_configs)
+            ),
+        ]
+
+    if uses_external_turns:
+        # The STT emits its own turn boundaries and owns interruptions. Local
+        # VAD is deliberately kept out of the default start strategies: it would
+        # win the race on raw voice activity and start the turn before the STT
+        # confirms a real turn.
+        return [ExternalUserTurnStartStrategy(enable_interruptions=True)]
+
+    return [TranscriptionUserTurnStartStrategy(), VADUserTurnStartStrategy()]
+
+
+def _create_non_realtime_user_turn_stop_strategies(
+    run_configs: dict, *, uses_external_turns: bool
+):
+    """Return user turn stop strategies for non-realtime pipelines."""
+
+    if uses_external_turns:
+        return [ExternalUserTurnStopStrategy()]
+
+    if run_configs.get("turn_stop_strategy") == "turn_analyzer":
+        smart_turn_params = SmartTurnParams(
+            stop_secs=run_configs.get(
+                "smart_turn_stop_secs", DEFAULT_SMART_TURN_STOP_SECS
+            )
+        )
+        return [
+            TurnAnalyzerUserTurnStopStrategy(
+                turn_analyzer=LocalSmartTurnAnalyzerV3(params=smart_turn_params)
+            )
+        ]
+
+    return [SpeechTimeoutUserTurnStopStrategy()]
+
+
+def _create_realtime_user_turn_config(provider: str):
+    """Return user turn strategies and optional local VAD for realtime providers."""
+
+    def external_provider_turn_config():
+        return (
+            UserTurnStrategies(
+                start=[ExternalUserTurnStartStrategy()],
+                stop=[ExternalUserTurnStopStrategy(wait_for_transcript=False)],
+            ),
+            None,
+        )
+
+    def local_vad_turn_config(*, enable_interruptions: bool):
+        return (
+            UserTurnStrategies(
+                start=[
+                    VADUserTurnStartStrategy(enable_interruptions=enable_interruptions)
+                ],
+                stop=[SpeechTimeoutUserTurnStopStrategy(wait_for_transcript=False)],
+            ),
+            SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
+        )
+
+    if provider in {
+        ServiceProviders.GOOGLE_REALTIME.value,
+        ServiceProviders.GOOGLE_VERTEX_REALTIME.value,
+    }:
+        # Let Gemini Live own barge-in via its server-side VAD, but keep local
+        # Silero VAD for early user-turn start and speaking-state tracking.
+        return local_vad_turn_config(enable_interruptions=False)
+
+    if provider in {
+        ServiceProviders.OPENAI_REALTIME.value,
+        ServiceProviders.AZURE_REALTIME.value,
+    }:
+        # OpenAI-compatible Realtime services already emit speaking-state frames
+        # and interruption events from the provider, so the aggregator should
+        # follow those external signals rather than run its own local VAD.
+        return external_provider_turn_config()
+    if provider == ServiceProviders.GROK_REALTIME.value:
+        # Grok Voice Agent emits server-side speech-start/stop and
+        # interruption signals, so local VAD should stay out of the way.
+        return external_provider_turn_config()
+    if provider == ServiceProviders.ULTRAVOX_REALTIME.value:
+        # Ultravox does not emit user-turn frames, so local VAD supplies
+        # lifecycle signals for Dograh observers/controllers.
+        return local_vad_turn_config(enable_interruptions=True)
+
+    return local_vad_turn_config(enable_interruptions=True)
+
+
+async def run_pipeline_telephony(
+    websocket,
+    *,
+    provider_name: str,
+    workflow_id: int,
+    workflow_run_id: int,
+    organization_id: int,
+    call_id: str,
+    transport_kwargs: dict,
+) -> None:
+    """Run a pipeline for any telephony provider."""
+    # Register before any async setup so deploy drains see calls that are still
+    # resolving DB/config/transport state.
+    register_worker_active_call(workflow_run_id)
+    try:
+        await _run_pipeline_telephony_impl(
+            websocket,
+            provider_name=provider_name,
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
+            organization_id=organization_id,
+            call_id=call_id,
+            transport_kwargs=transport_kwargs,
+        )
+    finally:
+        try:
+            await call_concurrency.unregister_active_call(workflow_run_id)
+        finally:
+            unregister_worker_active_call(workflow_run_id)
+
+
+async def _run_pipeline_telephony_impl(
+    websocket,
+    *,
+    provider_name: str,
+    workflow_id: int,
+    workflow_run_id: int,
+    organization_id: int,
+    call_id: str,
+    transport_kwargs: dict,
+) -> None:
+    """Run a pipeline for any telephony provider.
+
+    Replaces the previous per-provider run_pipeline_<x> functions. The
+    provider's transport factory and audio config are looked up from the
+    registry, so adding a new provider requires no changes here.
+
+    Args:
+        websocket: The accepted WebSocket from the provider.
+        provider_name: Stable identifier of the provider (registry key).
+        workflow_id: Workflow being executed.
+        workflow_run_id: Workflow run row.
+        organization_id: Tenant owning the workflow and the run. Every lookup
+            below is scoped by it; the workflow owner is read off the workflow
+            row and used only for attribution.
+        call_id: Provider call identifier.
+        transport_kwargs: Provider-specific kwargs forwarded to the transport
+            factory (e.g. stream_sid + call_sid for Twilio).
+    """
+    logger.debug(f"Running {provider_name} pipeline for workflow_run {workflow_run_id}")
+    set_current_run_id(workflow_run_id)
+
+    workflow = await db_client.get_workflow(
+        workflow_id, organization_id=organization_id
+    )
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    set_current_org_id(workflow.organization_id)
+
+    ambient_noise_config = None
+    if workflow.workflow_configurations:
+        ambient_noise_config = workflow.workflow_configurations.get(
+            "ambient_noise_configuration"
+        )
+
+    # The telephony config id is stamped on the workflow run when it's created
+    # (test call, campaign dispatch, inbound). Transports use it to load creds
+    # from the right config row. Falls back to None for legacy runs (transports
+    # then resolve the org's default config).
+    workflow_run = await db_client.get_workflow_run(
+        workflow_run_id, organization_id=organization_id
+    )
+    if not workflow_run:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+    if workflow_run.workflow_id != workflow_id:
+        raise HTTPException(status_code=400, detail="workflow_run_workflow_mismatch")
+
+    telephony_configuration_id = None
+    if workflow_run.initial_context:
+        telephony_configuration_id = workflow_run.initial_context.get(
+            "telephony_configuration_id"
+        )
+
+    # Resolve effective org config here so the transport can tune its
+    # bot-stopped-speaking fallback based on is_realtime; pass the resolved
+    # values into _run_pipeline so it doesn't fetch them again.
+    from api.services.configuration.ai_model_configuration import (
+        get_effective_ai_model_configuration_for_workflow,
+    )
+
+    run_configs = workflow_run.definition.workflow_configurations or {}
+    user_config = await get_effective_ai_model_configuration_for_workflow(
+        organization_id=workflow.organization_id,
+        workflow_configurations=run_configs,
+    )
+    is_realtime = bool(user_config.is_realtime and user_config.realtime is not None)
+
+    spec = telephony_registry.get(provider_name)
+    audio_config = create_audio_config(provider_name)
+
+    transport = await spec.transport_factory(
+        websocket,
+        workflow_run_id,
+        audio_config,
+        workflow.organization_id,
+        ambient_noise_config=ambient_noise_config,
+        telephony_configuration_id=telephony_configuration_id,
+        is_realtime=is_realtime,
+        **transport_kwargs,
+    )
+
+    try:
+        await _run_pipeline_impl(
+            transport,
+            workflow_id,
+            workflow_run_id,
+            # Attribution only — scoping is driven by organization_id below.
+            workflow.user_id,
+            audio_config=audio_config,
+            workflow_run=workflow_run,
+            resolved_user_config=user_config,
+            organization_id=organization_id,
+        )
+    except Exception as e:
+        # Closest layer to the failure and the only one with the traceback, so
+        # it owns the report; outer handlers see the mark and stay quiet.
+        logger.error(
+            f"[run {workflow_run_id}] Error in {provider_name} pipeline: {e}",
+            exc_info=True,
+        )
+        mark_failure_reported(e)
+        raise
+
+
+async def run_pipeline_smallwebrtc(
+    webrtc_connection: SmallWebRTCConnection,
+    workflow_id: int,
+    workflow_run_id: int,
+    user_id: int,
+    call_context_vars: dict = {},
+    user_provider_id: str | None = None,
+    organization_id: int | None = None,
+) -> None:
+    """Run pipeline for WebRTC connections."""
+    # Register before any async setup so deploy drains see calls that are still
+    # resolving DB/config/transport state.
+    register_worker_active_call(workflow_run_id)
+    try:
+        await _run_pipeline_smallwebrtc_impl(
+            webrtc_connection,
+            workflow_id,
+            workflow_run_id,
+            user_id,
+            call_context_vars=call_context_vars,
+            user_provider_id=user_provider_id,
+            organization_id=organization_id,
+        )
+    finally:
+        try:
+            await call_concurrency.unregister_active_call(workflow_run_id)
+        finally:
+            unregister_worker_active_call(workflow_run_id)
+
+
+async def _run_pipeline_smallwebrtc_impl(
+    webrtc_connection: SmallWebRTCConnection,
+    workflow_id: int,
+    workflow_run_id: int,
+    user_id: int,
+    call_context_vars: dict = {},
+    user_provider_id: str | None = None,
+    organization_id: int | None = None,
+) -> None:
+    """Run pipeline for WebRTC connections"""
+    logger.debug(
+        f"Running pipeline for WebRTC connection with workflow_id: {workflow_id} and workflow_run_id: {workflow_run_id}"
+    )
+    set_current_run_id(workflow_run_id)
+
+    workflow_scope = (
+        {"organization_id": organization_id}
+        if organization_id is not None
+        else {"user_id": user_id}
+    )
+
+    # Get workflow to extract all pipeline configurations.
+    workflow = await db_client.get_workflow(workflow_id, **workflow_scope)
+
+    # Set org context early so tasks created by the transport inherit it
+    if workflow:
+        set_current_org_id(workflow.organization_id)
+
+    ambient_noise_config = None
+    if workflow and workflow.workflow_configurations:
+        if "ambient_noise_configuration" in workflow.workflow_configurations:
+            ambient_noise_config = workflow.workflow_configurations[
+                "ambient_noise_configuration"
+            ]
+
+    # Create audio configuration for WebRTC
+    audio_config = create_audio_config(WorkflowRunMode.SMALLWEBRTC.value)
+
+    # Resolve workflow_run + effective org config here so the transport can
+    # tune its bot-stopped-speaking fallback based on is_realtime. _run_pipeline
+    # reuses these via kwargs so we don't fetch twice.
+    from api.services.configuration.ai_model_configuration import (
+        get_effective_ai_model_configuration_for_workflow,
+    )
+
+    workflow_run = await db_client.get_workflow_run(workflow_run_id, **workflow_scope)
+    if not workflow_run:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+    if workflow_run.workflow_id != workflow_id:
+        raise HTTPException(
+            status_code=400,
+            detail="workflow_run_workflow_mismatch",
+        )
+
+    run_configs = (
+        (workflow_run.definition.workflow_configurations or {}) if workflow_run else {}
+    )
+    user_config = await get_effective_ai_model_configuration_for_workflow(
+        organization_id=workflow.organization_id if workflow else None,
+        workflow_configurations=run_configs,
+    )
+    is_realtime = bool(user_config.is_realtime and user_config.realtime is not None)
+
+    transport = await create_webrtc_transport(
+        webrtc_connection,
+        workflow_run_id,
+        audio_config,
+        ambient_noise_config,
+        is_realtime=is_realtime,
+    )
+    await _run_pipeline_impl(
+        transport,
+        workflow_id,
+        workflow_run_id,
+        user_id,
+        call_context_vars=call_context_vars,
+        audio_config=audio_config,
+        user_provider_id=user_provider_id,
+        workflow_run=workflow_run,
+        resolved_user_config=user_config,
+        organization_id=organization_id,
+    )
+
+
+async def _run_pipeline(
+    transport,
+    workflow_id: int,
+    workflow_run_id: int,
+    user_id: int,
+    call_context_vars: dict = {},
+    audio_config: AudioConfig = None,
+    user_provider_id: str | None = None,
+    workflow_run=None,
+    resolved_user_config=None,
+    organization_id: int | None = None,
+) -> None:
+    """Run the pipeline with active-call drain accounting."""
+    register_worker_active_call(workflow_run_id)
+    try:
+        await _run_pipeline_impl(
+            transport,
+            workflow_id,
+            workflow_run_id,
+            user_id,
+            call_context_vars=call_context_vars,
+            audio_config=audio_config,
+            user_provider_id=user_provider_id,
+            workflow_run=workflow_run,
+            resolved_user_config=resolved_user_config,
+            organization_id=organization_id,
+        )
+    finally:
+        try:
+            await call_concurrency.unregister_active_call(workflow_run_id)
+        finally:
+            unregister_worker_active_call(workflow_run_id)
+
+
+async def _run_pipeline_impl(
+    transport,
+    workflow_id: int,
+    workflow_run_id: int,
+    user_id: int,
+    call_context_vars: dict = {},
+    audio_config: AudioConfig = None,
+    user_provider_id: str | None = None,
+    workflow_run=None,
+    resolved_user_config=None,
+    organization_id: int | None = None,
+) -> None:
+    """
+    Run the pipeline with the given transport and configuration
+
+    Args:
+        transport: The transport to use for the pipeline
+        workflow_id: The ID of the workflow
+        workflow_run_id: The ID of the workflow run
+        user_id: The ID of the user
+        workflow_run: Pre-fetched workflow run row. Fetched here if None.
+        resolved_user_config: Organization model configuration with workflow
+            model_overrides already applied. Fetched and resolved here if None.
+    """
+    workflow_scope = (
+        {"organization_id": organization_id}
+        if organization_id is not None
+        else {"user_id": user_id}
+    )
+
+    if workflow_run is None:
+        workflow_run = await db_client.get_workflow_run(
+            workflow_run_id, **workflow_scope
+        )
+    if not workflow_run:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+    if workflow_run.workflow_id != workflow_id:
+        raise HTTPException(
+            status_code=400,
+            detail="workflow_run_workflow_mismatch",
+        )
+
+    # If the workflow run is already completed, we don't need to run it again
+    if workflow_run.is_completed:
+        raise HTTPException(status_code=400, detail="Workflow run already completed")
+
+    merged_call_context_vars = dict(workflow_run.initial_context or {})
+    # Seed employee primary_language into call context when absent (UI canonical).
+    _run_cfg_early = (workflow_run.definition.workflow_configurations or {}) if workflow_run and workflow_run.definition else {}
+    _wf_primary = (_run_cfg_early.get("primary_language") if isinstance(_run_cfg_early, dict) else None)
+    if _wf_primary and not merged_call_context_vars.get("astra_primary_language"):
+        merged_call_context_vars["astra_primary_language"] = _wf_primary
+        merged_call_context_vars.setdefault("primary_language", _wf_primary)
+    # If there is some extra call_context_vars, fold them in. Persistence
+    # happens once below, after runtime_configuration is also resolved.
+    if call_context_vars:
+        merged_call_context_vars = merge_external_initial_context(
+            merged_call_context_vars, call_context_vars
+        )
+
+    # AI Employee identity: employee.name from the console (activated workflow
+    # config, else the session context) -> {{employee_name}} for prompts and
+    # greetings on web and PSTN calls alike. Separate from caller_name.
+    try:
+        from api.services.pipecat.caller_facts import identity_context_vars
+
+        _run_def = getattr(workflow_run, "definition", None)
+        _ident_cfg = (getattr(_run_def, "workflow_configurations", None) or {}) if _run_def else {}
+        merged_call_context_vars.update(
+            identity_context_vars(_ident_cfg, merged_call_context_vars)
+        )
+    except Exception as _ident_err:  # never block a call on identity
+        logger.warning(f"employee identity skipped: {_ident_err}")
+
+    # Astra spoken name: canonical contact name stays as stored; the employee
+    # speaks a runtime spoken_name in the call language's script. Never written
+    # back to the contact. Rollback: ASTRA_SPOKEN_NAME=0.
+    try:
+        import os as _os
+
+        if _os.environ.get("ASTRA_SPOKEN_NAME", "1") != "0":
+            from api.services.pipecat.spoken_name import to_spoken as _to_spoken
+
+            _canon = str(merged_call_context_vars.get("contact_canonical_name")
+                         or merged_call_context_vars.get("contact_name") or "").strip()
+            _slang = str(merged_call_context_vars.get("astra_primary_language")
+                         or merged_call_context_vars.get("primary_language") or "").strip()
+            if _canon:
+                _spoken = _to_spoken(_canon, _slang)
+                merged_call_context_vars["contact_canonical_name"] = _canon
+                merged_call_context_vars["contact_spoken_name"] = _spoken
+                merged_call_context_vars["contact_spoken_language"] = _slang
+                if _spoken and _spoken != _canon:
+                    merged_call_context_vars["contact_name"] = _spoken
+                    for _k in ("contact_context", "memory_context"):
+                        if isinstance(merged_call_context_vars.get(_k), str):
+                            merged_call_context_vars[_k] = merged_call_context_vars[_k].replace(_canon, _spoken)
+                logger.info(f"spoken name: lang={_slang} changed={_spoken != _canon}")
+    except Exception as _sn_err:  # never block a call on naming
+        logger.warning(f"spoken name skipped: {_sn_err}")
+
+    # Get workflow for metadata (name, organization_id, call_disposition_codes)
+    workflow = await db_client.get_workflow(workflow_id, **workflow_scope)
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    # Use the run's pinned definition for graph + configs (not the workflow's current)
+    run_definition = workflow_run.definition
+    run_workflow_json = run_definition.workflow_json
+    run_configs = run_definition.workflow_configurations or {}
+
+    # Extract configurations from the version's workflow_configurations
+    max_call_duration_seconds = DEFAULT_MAX_CALL_DURATION_SECONDS
+    max_user_idle_timeout = DEFAULT_MAX_USER_IDLE_TIMEOUT_SECONDS
+    keyterms = None  # Dictionary words for STT boosting
+    transcript_config = run_configs.get("transcript_configuration") or {}
+    include_transcript_end_timestamps = bool(
+        transcript_config.get("include_end_timestamps", False)
+    )
+
+    if run_configs:
+        if "max_call_duration" in run_configs:
+            max_call_duration_seconds = run_configs["max_call_duration"]
+
+        if "max_user_idle_timeout" in run_configs:
+            max_user_idle_timeout = run_configs["max_user_idle_timeout"]
+
+        if "dictionary" in run_configs:
+            dictionary = run_configs["dictionary"]
+            if dictionary and isinstance(dictionary, str):
+                keyterms = [
+                    term.strip() for term in dictionary.split(",") if term.strip()
+                ]
+
+    # Resolve model overrides from the version onto global org config (skip
+    # when the caller already resolved it).
+    if resolved_user_config is None:
+        from api.services.configuration.ai_model_configuration import (
+            get_effective_ai_model_configuration_for_workflow,
+        )
+
+        user_config = await get_effective_ai_model_configuration_for_workflow(
+            organization_id=workflow.organization_id,
+            workflow_configurations=run_configs,
+        )
+    else:
+        user_config = resolved_user_config
+
+    workflow_graph = WorkflowGraph(
+        ReactFlowDTO.model_validate(run_workflow_json),
+        skip_instance_constraints_for={"trigger"},
+    )
+    uses_variable_extraction = workflow_graph.uses_variable_extraction()
+    # Generic regional spoken-style profile (e.g. te-IN + telangana/andhra/neutral).
+    # No-op unless workflow_configurations sets primary_language AND a supported
+    # regional_language_style. Language codes and TTS language are unchanged.
+    try:
+        from api.services.pipecat.regional_language_style import (
+            apply_regional_style_to_graph,
+        )
+
+        _regional_applied = apply_regional_style_to_graph(workflow_graph, run_configs)
+        if _regional_applied:
+            logger.info(f"regional_language_style applied: {_regional_applied}")
+    except Exception as _regional_err:  # never block a call on style injection
+        logger.warning(f"regional_language_style skipped: {_regional_err}")
+    # Generic Product Knowledge + Configured Actions/Tools (opt-in via
+    # workflow_configurations.product_knowledge). Tools are detected from this
+    # workflow's own nodes. No-op for workflows without product_knowledge.
+    try:
+        from api.services.pipecat.product_knowledge import (
+            PRODUCT_KNOWLEDGE_KEY,
+            apply_product_knowledge_to_graph,
+            load_configured_tools,
+        )
+
+        if run_configs.get(PRODUCT_KNOWLEDGE_KEY):
+            _pk_tools = await load_configured_tools(workflow_graph, workflow.organization_id)
+            _pk_applied = apply_product_knowledge_to_graph(workflow_graph, run_configs, _pk_tools)
+            if _pk_applied:
+                logger.info(f"product_knowledge applied: {_pk_applied}")
+    except Exception as _pk_err:  # never block a call on knowledge injection
+        logger.warning(f"product_knowledge skipped: {_pk_err}")
+
+    from api.services.managed_model_services import (
+        MPS_CORRELATION_ID_CONTEXT_KEY,
+        ensure_mps_correlation_id,
+    )
+
+    mps_correlation_id = await ensure_mps_correlation_id(
+        ai_model_config=user_config,
+        workflow_run_id=workflow_run_id,
+        initial_context=merged_call_context_vars,
+    )
+    if mps_correlation_id:
+        merged_call_context_vars[MPS_CORRELATION_ID_CONTEXT_KEY] = mps_correlation_id
+
+    # Detect realtime mode (speech-to-speech services like OpenAI Realtime, Gemini Live)
+    is_realtime = user_config.is_realtime and user_config.realtime is not None
+
+    # Create services based on user configuration
+    if is_realtime:
+        llm = create_realtime_llm_service(user_config, audio_config)
+        stt = None
+        tts = None
+        # Realtime services don't implement run_inference, so create a
+        # separate text LLM for variable extraction and other out-of-band
+        # inference calls.
+        inference_llm = create_llm_service(
+            user_config,
+            correlation_id=mps_correlation_id,
+        )
+    else:
+        stt = create_stt_service(
+            user_config,
+            audio_config,
+            keyterms=keyterms,
+            correlation_id=mps_correlation_id,
+        )
+        tts = create_tts_service(
+            user_config,
+            audio_config,
+            correlation_id=mps_correlation_id,
+        )
+        try:
+            from api.services.pipecat.tts_error_log import tag_tts_service
+
+            tag_tts_service(
+                tts,
+                user_config=user_config,
+                workflow_id=workflow_id,
+                workflow_run_id=workflow_run_id,
+                call_context={
+                    **(merged_call_context_vars or {}),
+                    "regional_language_style": (
+                        (merged_call_context_vars or {}).get("regional_language_style")
+                        or ((run_configs or {}).get("regional_language_style") if isinstance(run_configs, dict) else None)
+                    ),
+                },
+            )
+        except Exception as _tts_tag_exc:  # pragma: no cover
+            logger.debug(f"ASTRA_TTS_FAILURE tagging skipped: {_tts_tag_exc}")
+        llm = create_llm_service(user_config, correlation_id=mps_correlation_id)
+        inference_llm = None
+
+    # A shared LLM cannot carry an extraction usage_context without also tagging
+    # normal conversation or context-summarization requests. Create a dedicated
+    # client only for the managed provider; other providers ignore usage_context.
+    variable_extraction_llm = (
+        create_llm_service(
+            user_config,
+            correlation_id=mps_correlation_id,
+            usage_context="variable_extraction",
+        )
+        if uses_variable_extraction
+        and user_config.llm.provider == ServiceProviders.DOGRAH.value
+        else inference_llm or llm
+    )
+    # Astra: separate OpenRouter model for background extraction (After-call card).
+    try:
+        _astra_sm = getattr(user_config.llm, "summary_model", None)
+        if (
+            _astra_sm
+            and not is_realtime
+            and user_config.llm.provider == ServiceProviders.OPENROUTER.value
+            and str(_astra_sm).strip() != str(user_config.llm.model)
+        ):
+            from api.services.pipecat.service_factory import (
+                create_llm_service_with_model_override as _astra_cwo,
+            )
+
+            variable_extraction_llm = _astra_cwo(
+                user_config,
+                str(_astra_sm).strip(),
+                correlation_id=mps_correlation_id,
+                usage_context="variable_extraction",
+            )
+            logger.info(f"ASTRA_SUMMARY_MODEL extraction model={_astra_sm}")
+    except Exception as _astra_sm_err:  # never block a call; fall back to reply model
+        logger.warning(f"ASTRA_SUMMARY_MODEL skipped: {_astra_sm_err}")
+
+    # Stamp the providers/models actually resolved for this run onto
+    # initial_context so they're available for post-call analytics
+    # (model_overrides may have shifted them away from the org-level
+    # user_config).
+    if is_realtime:
+        # llm_* refers to the side-channel text LLM (variable extraction,
+        # voicemail detection); realtime_* is the speech-to-speech service.
+        runtime_configuration = {
+            "realtime_provider": user_config.realtime.provider,
+            "realtime_model": user_config.realtime.model,
+            "llm_provider": user_config.llm.provider,
+            "llm_model": user_config.llm.model,
+        }
+    else:
+        runtime_configuration = {
+            "stt_provider": user_config.stt.provider,
+            "stt_model": user_config.stt.model,
+            "tts_provider": user_config.tts.provider,
+            "tts_model": user_config.tts.model,
+            "llm_provider": user_config.llm.provider,
+            "llm_model": user_config.llm.model,
+        }
+    merged_call_context_vars = {
+        **merged_call_context_vars,
+        "runtime_configuration": runtime_configuration,
+    }
+    await db_client.update_workflow_run(
+        workflow_run_id, initial_context=merged_call_context_vars
+    )
+
+    # Pre-call fetch: fire early so it runs concurrently with remaining setup
+    pre_call_fetch_task = None
+    start_node = workflow_graph.nodes.get(workflow_graph.start_node_id)
+    call_direction = getattr(workflow_run, "call_type", None)
+    if hasattr(call_direction, "value"):
+        call_direction = call_direction.value
+    call_direction = call_direction or merged_call_context_vars.get("direction")
+    if (
+        start_node
+        and start_node.should_run_pre_call_fetch(call_direction)
+        and start_node.pre_call_fetch_url
+    ):
+        logger.info(
+            f"Pre-call fetch enabled for {call_direction or 'unknown'} workflow "
+            f"run {workflow_run_id}, "
+            f"firing request to {start_node.pre_call_fetch_url}"
+        )
+        pre_call_fetch_task = asyncio.create_task(
+            execute_pre_call_fetch(
+                url=start_node.pre_call_fetch_url,
+                credential_uuid=start_node.pre_call_fetch_credential_uuid,
+                call_context_vars=merged_call_context_vars,
+                workflow_id=workflow_id,
+                organization_id=workflow.organization_id,
+            )
+        )
+
+    # Create in-memory logs buffer early so it can be used by engine callbacks
+    in_memory_logs_buffer = InMemoryLogsBuffer(workflow_run_id)
+
+    # Create node transition callback (always logs to buffer, optionally streams to WS)
+    ws_sender = get_ws_sender(workflow_run_id)
+
+    async def send_node_transition(
+        node_id: str,
+        node_name: str,
+        previous_node_id: Optional[str],
+        previous_node_name: Optional[str],
+        allow_interrupt: bool = False,
+    ) -> None:
+        """Send node transition event to logs buffer and optionally via WebSocket."""
+        # Update current node on the buffer so subsequent events are tagged
+        in_memory_logs_buffer.set_current_node(node_id, node_name)
+
+        message = build_node_transition_event(
+            node_id=node_id,
+            node_name=node_name,
+            previous_node_id=previous_node_id,
+            previous_node_name=previous_node_name,
+            allow_interrupt=allow_interrupt,
+        )
+        # Send via WebSocket if available
+        if ws_sender:
+            try:
+                await ws_sender({**message, "node_id": node_id, "node_name": node_name})
+            except Exception as e:
+                logger.debug(f"Failed to send node transition via WebSocket: {e}")
+
+        # Always log to in-memory buffer (node_id/node_name injected by buffer's append)
+        try:
+            await in_memory_logs_buffer.append(message)
+        except Exception as e:
+            logger.error(f"Failed to append node transition to logs buffer: {e}")
+
+    node_transition_callback = send_node_transition
+
+    # Extract embeddings configuration from user config
+    embeddings_api_key = None
+    embeddings_model = None
+    embeddings_base_url = None
+    embeddings_provider = None
+    embeddings_endpoint = None
+    embeddings_api_version = None
+    if user_config and user_config.embeddings:
+        from api.services.configuration.ai_model_configuration import (
+            apply_managed_embeddings_base_url,
+        )
+
+        embeddings_api_key = user_config.embeddings.api_key
+        embeddings_model = user_config.embeddings.model
+        embeddings_provider = getattr(user_config.embeddings, "provider", None)
+        embeddings_base_url = apply_managed_embeddings_base_url(
+            provider=embeddings_provider,
+            base_url=getattr(user_config.embeddings, "base_url", None),
+        )
+        embeddings_endpoint = getattr(user_config.embeddings, "endpoint", None)
+        embeddings_api_version = getattr(user_config.embeddings, "api_version", None)
+
+    # Check if the workflow has any active recordings so the engine can
+    # include recording response mode instructions in all node prompts.
+    has_recordings = await db_client.has_active_recordings(workflow.organization_id)
+
+    context_compaction_enabled = (workflow.workflow_configurations or {}).get(
+        "context_compaction_enabled", False
+    )
+    # Context compaction doesn't apply in realtime mode: the speech-to-speech
+    # service manages its own conversation state server-side.
+    if is_realtime and context_compaction_enabled:
+        logger.info("Disabling context_compaction_enabled for realtime workflow run")
+        context_compaction_enabled = False
+
+    engine = PipecatEngine(
+        llm=llm,
+        inference_llm=inference_llm,
+        variable_extraction_llm=variable_extraction_llm,
+        workflow=workflow_graph,
+        call_context_vars=merged_call_context_vars,
+        workflow_run_id=workflow_run_id,
+        node_transition_callback=node_transition_callback,
+        embeddings_api_key=embeddings_api_key,
+        embeddings_model=embeddings_model,
+        embeddings_base_url=embeddings_base_url,
+        embeddings_provider=embeddings_provider,
+        embeddings_endpoint=embeddings_endpoint,
+        embeddings_api_version=embeddings_api_version,
+        has_recordings=has_recordings,
+        context_compaction_enabled=context_compaction_enabled,
+    )
+
+    # Per-call caller facts store (opt-in via workflow_configurations.caller_facts).
+    caller_facts_processors = []
+    caller_facts_post_processors = []
+    try:
+        from api.services.pipecat import caller_facts as _cf
+
+        if _cf.is_enabled(run_configs) and not is_realtime:
+            _cf_tracker = _cf.CallerFactsTracker(engine, run_configs)
+            engine.attach_caller_facts(_cf_tracker)
+            caller_facts_processors.append(_cf.build_tracker_processor(_cf_tracker))
+            caller_facts_post_processors.append(_cf.build_repeat_question_guard(_cf_tracker))
+            logger.info(
+                f"caller_facts enabled: {len(_cf_tracker.store.fields)} fields, "
+                f"employee_name_set={bool(_cf_tracker.employee_name)}"
+            )
+    except Exception as _cf_err:  # never block a call on memory
+        logger.warning(f"caller_facts skipped: {_cf_err}")
+
+    # Create pipeline components
+    audio_buffer, context = create_pipeline_components(audio_config)
+
+    integration_runtime_sessions = create_runtime_sessions(
+        IntegrationRuntimeContext(
+            workflow_run_id=workflow_run_id,
+            workflow_run=workflow_run,
+            workflow_graph=workflow_graph,
+            run_definition=run_definition,
+            user_config=user_config,
+            is_realtime=is_realtime,
+            context_messages_provider=lambda: context.messages,
+        )
+    )
+
+    # Set the context, audio_config, and audio_buffer after creation
+    engine.set_context(context)
+    engine.set_audio_config(audio_config)
+
+    assistant_params = LLMAssistantAggregatorParams(
+        correct_aggregation_callback=engine.create_aggregation_correction_callback(),
+    )
+
+    user_mute_strategies = [
+        MuteUntilFirstBotCompleteUserMuteStrategy(),
+        FunctionCallUserMuteStrategy(),
+        CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user),
+    ]
+    user_vad_analyzer = SileroVADAnalyzer(params=VADParams(stop_secs=0.2))
+
+    # Configure turn strategies based on STT provider, model, and workflow configuration
+    if is_realtime:
+        uses_external_turns = False
+        # Realtime services still need user-turn tracking even when the model
+        # itself owns speech generation and interruption behavior.
+        user_turn_strategies, user_vad_analyzer = _create_realtime_user_turn_config(
+            user_config.realtime.provider
+        )
+    else:
+        # Some STT services emit their own turn boundaries, so the aggregator
+        # follows those external signals. Other models use configurable turn
+        # detection.
+        uses_external_turns = stt_uses_external_turns(user_config)
+        user_turn_start_strategies = _create_non_realtime_user_turn_start_strategies(
+            run_configs,
+            uses_external_turns=uses_external_turns,
+        )
+        # Astra WF32 (guard v2 echo filter): tap the bot's text before TTS, only when the
+        # workflow config enables astra_barge_in_guard.echo_filter.
+        try:
+            from api.services.pipecat.astra_barge_in_guard import bot_text_tap_for
+
+            _astra_bot_text_tap = bot_text_tap_for(user_turn_start_strategies)
+        except Exception as _tap_err:
+            logger.warning(f"astra bot text tap skipped: {_tap_err}")
+            _astra_bot_text_tap = None
+        turn_start_strategy = run_configs.get(
+            "turn_start_strategy", DEFAULT_TURN_START_STRATEGY
+        )
+        logger.info(
+            f"[run {workflow_run_id}] Non-realtime interrupt strategy "
+            f"requested={turn_start_strategy} "
+            f"uses_external_turns={uses_external_turns}"
+        )
+
+        user_turn_stop_strategies = _create_non_realtime_user_turn_stop_strategies(
+            run_configs,
+            uses_external_turns=uses_external_turns,
+        )
+        user_turn_strategies = UserTurnStrategies(
+            start=user_turn_start_strategies,
+            stop=user_turn_stop_strategies,
+        )
+
+    user_turn_stop_timeout = _resolve_user_turn_stop_timeout(
+        run_configs,
+        uses_external_turns=uses_external_turns,
+    )
+
+    user_params = LLMUserAggregatorParams(
+        user_turn_strategies=user_turn_strategies,
+        user_mute_strategies=user_mute_strategies,
+        user_turn_stop_timeout=user_turn_stop_timeout,
+        user_idle_timeout=max_user_idle_timeout,
+        vad_analyzer=user_vad_analyzer,
+    )
+    context_aggregator = LLMContextAggregatorPair(
+        context,
+        assistant_params=assistant_params,
+        user_params=user_params,
+        realtime_service_mode=is_realtime,
+    )
+
+    # Create usage metrics aggregator with engine's callback
+    pipeline_engine_callback_processor = PipelineEngineCallbacksProcessor(
+        max_call_duration_seconds=max_call_duration_seconds,
+        max_duration_end_task_callback=engine.create_max_duration_callback(),
+        generation_started_callback=engine.create_generation_started_callback(),
+        llm_text_frame_callback=engine.handle_llm_text_frame,
+    )
+
+    pipeline_metrics_aggregator = PipelineMetricsAggregator()
+
+    user_context_aggregator = context_aggregator.user()
+    assistant_context_aggregator = context_aggregator.assistant()
+
+    # Register user idle event handlers
+    user_idle_handler = engine.create_user_idle_handler()
+
+    @user_context_aggregator.event_handler("on_user_turn_idle")
+    async def on_user_turn_idle(aggregator):
+        await user_idle_handler.handle_idle(aggregator)
+
+    @user_context_aggregator.event_handler("on_user_turn_started")
+    async def on_user_turn_started(aggregator, strategy):
+        user_idle_handler.reset()
+
+    voicemail_detector = None
+    recording_router = None
+
+    # Create recording audio fetcher (used by recording router, audio greetings,
+    # and audio transition speech)
+    fetch_audio = create_recording_audio_fetcher(
+        organization_id=workflow.organization_id,
+        pipeline_sample_rate=audio_config.pipeline_sample_rate,
+    )
+    engine.set_fetch_recording_audio(fetch_audio)
+
+    voicemail_config = (workflow.workflow_configurations or {}).get(
+        "voicemail_detection", {}
+    )
+    if is_realtime and voicemail_config.get("enabled", False):
+        logger.info(
+            f"Disabling voicemail detection for realtime workflow run {workflow_run_id}"
+        )
+    if voicemail_config.get("enabled", False) and not is_realtime:
+        logger.info(f"Voicemail detection enabled for workflow run {workflow_run_id}")
+        # Create a separate LLM instance for the voicemail sub-pipeline
+        # (can't share with main pipeline as it would mess up frame linking)
+        if voicemail_config.get("use_workflow_llm", True):
+            voicemail_llm = create_llm_service(
+                user_config,
+                correlation_id=mps_correlation_id,
+                usage_context="voicemail_detection",
+            )
+        else:
+            voicemail_llm = create_llm_service_from_provider(
+                provider=voicemail_config.get("provider", "openai"),
+                model=voicemail_config.get("model", "gpt-4.1"),
+                api_key=voicemail_config.get("api_key", ""),
+                usage_context="voicemail_detection",
+            )
+
+        long_speech_timeout = voicemail_config.get("long_speech_timeout", 8.0)
+        custom_system_prompt = voicemail_config.get("system_prompt") or None
+
+        voicemail_detector = VoicemailDetector(
+            llm=voicemail_llm,
+            long_speech_timeout=long_speech_timeout,
+            custom_system_prompt=custom_system_prompt,
+        )
+
+        # Register event handler to end task when voicemail is detected
+        @voicemail_detector.event_handler("on_voicemail_detected")
+        async def _on_voicemail_detected(_processor):
+            logger.info(f"Voicemail detected for workflow run {workflow_run_id}")
+            await engine.end_call_with_reason(
+                reason=EndTaskReason.VOICEMAIL_DETECTED.value,
+                abort_immediately=True,
+            )
+
+    # Recording router is only meaningful in non-realtime mode (it routes between
+    # pre-recorded audio playback and dynamic TTS; realtime LLMs produce audio
+    # directly).
+    if not is_realtime and has_recordings:
+        recording_router = RecordingRouterProcessor(
+            audio_sample_rate=audio_config.pipeline_sample_rate,
+            fetch_recording_audio=fetch_audio,
+        )
+        # Warm the recording cache in the background so audio is ready
+        # before the first playback request.
+        asyncio.create_task(
+            warm_recording_cache(
+                organization_id=workflow.organization_id,
+                pipeline_sample_rate=audio_config.pipeline_sample_rate,
+            )
+        )
+
+    # Build the pipeline
+    if is_realtime:
+        pipeline = build_realtime_pipeline(
+            transport,
+            llm,
+            audio_buffer,
+            user_context_aggregator,
+            assistant_context_aggregator,
+            pipeline_engine_callback_processor,
+            pipeline_metrics_aggregator,
+            voicemail_detector=voicemail_detector,
+        )
+    else:
+        pipeline = build_pipeline(
+            transport,
+            stt,
+            audio_buffer,
+            llm,
+            tts,
+            user_context_aggregator,
+            assistant_context_aggregator,
+            pipeline_engine_callback_processor,
+            pipeline_metrics_aggregator,
+            voicemail_detector=voicemail_detector,
+            recording_router=recording_router,
+            workflow_configurations=run_configs,
+            call_context_vars=merged_call_context_vars,
+            pre_llm_processors=caller_facts_processors,
+            post_llm_processors=caller_facts_post_processors,
+            **({"pre_tts_processors": [_astra_bot_text_tap]} if _astra_bot_text_tap else {}),
+        )
+
+    # Create pipeline task with audio configuration
+    task = create_pipeline_task(pipeline, workflow_run_id, audio_config)
+    transcript_log_coordinator = TranscriptLogCoordinator(in_memory_logs_buffer)
+    if task.turn_tracking_observer is None:
+        raise RuntimeError("Transcript logging requires turn tracking to be enabled")
+    transcript_log_coordinator.attach_turn_tracking_observer(
+        task.turn_tracking_observer
+    )
+
+    for runtime_session in integration_runtime_sessions:
+        runtime_session.attach(task)
+        logger.info(
+            "[integrations] attached runtime session '{}' for workflow run {}",
+            runtime_session.name,
+            workflow_run_id,
+        )
+
+    # Now set the task and transport output on the engine
+    engine.set_task(task)
+    engine.set_transport_output(transport.output())
+
+    # Add the observer before initialization so early ErrorFrames are not missed.
+    feedback_observer = RealtimeFeedbackObserver(
+        ws_sender=ws_sender,
+        logs_buffer=in_memory_logs_buffer,
+    )
+    task.add_observer(feedback_observer)
+
+    # Instrumentation only: per-turn stage timestamps (STAGE_LAT log lines).
+    try:
+        from api.services.pipecat.stage_latency_observer import (
+            StageLatencyObserver,
+            stage_latency_enabled,
+        )
+
+        if stage_latency_enabled():
+            task.add_observer(StageLatencyObserver(workflow_run_id))
+    except Exception as e:
+        logger.warning(f"StageLatencyObserver not attached: {e}")
+
+    # Initialize the engine to set the initial context with
+    # System Prompt and Tools
+    await engine.initialize()
+
+    # Register latency observer to log user-to-bot response latency
+    if task.user_bot_latency_observer:
+
+        @task.user_bot_latency_observer.event_handler("on_latency_measured")
+        async def on_latency_measured(observer, latency_seconds):
+            message = {
+                "type": RealtimeFeedbackType.LATENCY_MEASURED.value,
+                "payload": {
+                    "latency_seconds": latency_seconds,
+                },
+            }
+            if ws_sender:
+                try:
+                    ws_message = message
+                    if in_memory_logs_buffer.current_node_id:
+                        ws_message = {
+                            **message,
+                            "node_id": in_memory_logs_buffer.current_node_id,
+                            "node_name": in_memory_logs_buffer.current_node_name,
+                        }
+                    await ws_sender(ws_message)
+                except Exception as e:
+                    logger.debug(f"Failed to send latency via WebSocket: {e}")
+            try:
+                await in_memory_logs_buffer.append(message)
+            except Exception as e:
+                logger.error(f"Failed to append latency to logs buffer: {e}")
+
+    # Register turn log handlers for all call types (WebRTC and telephony)
+    register_turn_log_handlers(
+        transcript_log_coordinator,
+        user_context_aggregator,
+        assistant_context_aggregator,
+    )
+
+    # Register event handlers — resolve provider_id for PostHog tracking
+    if not user_provider_id:
+        user_obj = await db_client.get_user_by_id(user_id)
+        user_provider_id = str(user_obj.provider_id) if user_obj else None
+    in_memory_audio_buffer = register_event_handlers(
+        task,
+        transport,
+        workflow_run_id,
+        engine=engine,
+        audio_buffer=audio_buffer,
+        in_memory_logs_buffer=in_memory_logs_buffer,
+        transcript_log_coordinator=transcript_log_coordinator,
+        pipeline_metrics_aggregator=pipeline_metrics_aggregator,
+        audio_config=audio_config,
+        pre_call_fetch_task=pre_call_fetch_task,
+        user_provider_id=user_provider_id,
+        integration_runtime_sessions=integration_runtime_sessions,
+        include_transcript_end_timestamps=include_transcript_end_timestamps,
+    )
+
+    register_audio_data_handler(audio_buffer, workflow_run_id, in_memory_audio_buffer)
+
+    try:
+        # Run the pipeline
+        await run_pipeline_worker(task)
+        logger.info(f"Task completed for run {workflow_run_id}")
+    except asyncio.CancelledError:
+        logger.warning("Received CancelledError in _run_pipeline")
+    finally:
+        # Close MCP sessions here, not in engine.cleanup(). The anyio cancel
+        # scopes opened by MCPClient.start() in engine.initialize() are
+        # task-affine; this finally runs in the same task as initialize(),
+        # whereas engine.cleanup() runs in a pipecat event-handler task.
+        await engine.close_mcp_sessions()
+        await feedback_observer.cleanup()
+        logger.debug(f"Cleaned up context providers for workflow run {workflow_run_id}")
