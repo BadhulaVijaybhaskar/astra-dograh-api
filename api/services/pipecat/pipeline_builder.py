@@ -130,6 +130,7 @@ def build_pipeline(
     pre_llm_processors=None,
     post_llm_processors=None,
     pre_tts_processors=None,
+    speculative_llm=None,
 ):
     """Build the main pipeline with all components.
 
@@ -141,7 +142,14 @@ def build_pipeline(
         recording_router: Optional RecordingRouterProcessor. When provided,
             inserts between callback processor and TTS to route between
             pre-recorded audio playback and dynamic TTS.
+        speculative_llm: Optional ``SpeculativeReplyController``
+            (astra_speculative_llm). When provided (and no voicemail gate), starts
+            the LLM on the partial transcript: tap before the user aggregator,
+            injector right before the LLM, gate right after it.
     """
+    if speculative_llm is not None and voicemail_detector:
+        logger.info("speculative LLM disabled: voicemail LLM gate in pipeline")
+        speculative_llm = None
     session = _build_session_language_state(
         tts,
         primary_language=primary_language,
@@ -219,6 +227,8 @@ def build_pipeline(
     # bot-text tap). None -> pipeline unchanged.
     post_llm.extend(list(pre_tts_processors or []))
 
+    if speculative_llm is not None:
+        processors.append(speculative_llm.tap)
     processors.append(user_context_aggregator)
 
     # Insert LLM gate before the main LLM when voicemail detection is enabled.
@@ -230,9 +240,13 @@ def build_pipeline(
     # Optional processors that observe each LLM request (e.g. caller facts).
     processors.extend(list(pre_llm_processors or []))
 
+    if speculative_llm is not None:
+        processors.append(speculative_llm.injector)
+
     processors.extend(
         [
             llm,  # LLM
+            *([speculative_llm.gate] if speculative_llm is not None else []),
             *post_llm,
             tts,  # TTS
             transport.output(),  # Transport bot output

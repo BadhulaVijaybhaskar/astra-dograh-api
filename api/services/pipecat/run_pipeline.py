@@ -1191,6 +1191,30 @@ async def _run_pipeline_impl(
             )
         )
 
+    # Astra: start the LLM on the partial transcript (opt-in per workflow).
+    _astra_speculative_llm = None
+    if not is_realtime:
+        try:
+            from api.services.pipecat.astra_speculative_llm import (
+                build_speculative_controller,
+            )
+
+            _astra_speculative_llm = build_speculative_controller(
+                run_configs,
+                user_context_aggregator=user_context_aggregator,
+                llm=llm,
+                is_realtime=is_realtime,
+                voicemail_enabled=voicemail_detector is not None,
+            )
+            if _astra_speculative_llm is not None:
+                logger.info(
+                    f"[run {workflow_run_id}] speculative LLM on partial transcript: "
+                    f"{_astra_speculative_llm.config}"
+                )
+        except Exception as _spec_err:
+            logger.warning(f"speculative LLM not enabled: {_spec_err}")
+            _astra_speculative_llm = None
+
     # Build the pipeline
     if is_realtime:
         pipeline = build_realtime_pipeline(
@@ -1221,6 +1245,7 @@ async def _run_pipeline_impl(
             pre_llm_processors=caller_facts_processors,
             post_llm_processors=caller_facts_post_processors,
             **({"pre_tts_processors": [_astra_bot_text_tap]} if _astra_bot_text_tap else {}),
+            speculative_llm=_astra_speculative_llm,
         )
 
     # Create pipeline task with audio configuration
