@@ -547,7 +547,15 @@ class CustomToolManager:
                         {"status": "success", "action": "ending_call"},
                         properties=properties,
                     )
-                    played = await self._play_config_message(config)
+                    if _ct.said_goodbye(already):
+                        # the reply already said goodbye: don't speak a second one
+                        eng.termination.event(
+                            "closing_message_skipped_already_said_goodbye",
+                            tool=function_name,
+                        )
+                        played = False
+                    else:
+                        played = await self._play_config_message(config)
                     eng.termination.no_closing_generation(
                         config.get("customMessage", "") if played else already,
                         queued=bool(played),

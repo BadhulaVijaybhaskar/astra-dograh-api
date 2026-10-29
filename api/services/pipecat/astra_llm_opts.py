@@ -26,7 +26,7 @@ from loguru import logger
 
 EFFORTS = ("none", "minimal", "low", "medium", "high")
 _REASONING_RE = re.compile(
-    r"(gpt-5|(^|/)o[134](-|$)|deepseek-r1|reasoner|thinking|gpt-oss|claude-(sonnet|opus)-4|"
+    r"(gpt-5|(^|/)o[134](-|$)|deepseek-r1|deepseek-v3\.[1-9]|deepseek-v4|reasoner|thinking|gpt-oss|claude-(sonnet|opus)-4|"
     r"claude-[34]\.7|gemini-2\.5|gemini-3|grok-[34]|qwen3|magistral)",
     re.I,
 )

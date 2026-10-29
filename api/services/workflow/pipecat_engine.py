@@ -1106,7 +1106,7 @@ class PipecatEngine:
             properties=FunctionCallResultProperties(run_llm=False),
         )
         spoke = len([w for w in already.split() if any(ch.isalnum() for ch in w)]) >= 3
-        if spoke:
+        if spoke or _ct.said_goodbye(already):
             # this turn already streamed text: that text is the closing; never add
             # a second goodbye
             self.termination.event("closing_line_skipped_already_spoke", closing_line=closing[:200])

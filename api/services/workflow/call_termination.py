@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Optional
@@ -383,3 +384,21 @@ def end_call_action_enabled() -> bool:
 def same_text(a: str, b: str) -> bool:
     n = lambda x: "".join(ch for ch in (x or "") if ch.isalnum())
     return bool(n(b)) and n(b) in n(a)
+
+
+# Goodbye words in the languages our employees speak. If the reply streamed in this
+# same turn already contains one, the separate spoken hang-up line (end_call
+# closing_line or an end-call tool's message) is skipped so the caller never hears
+# two goodbyes.
+_GOODBYE_RE = re.compile(
+    r"(\bbye\b|good\s*bye|take\s*care|have\s+a\s+(good|great|nice)\s+(day|evening|night)|"
+    r"ధన్యవాదాలు|ధన్యవాదం|సెలవు|"
+    r"धन्यवाद|शुक्रिया|अलविदा|फिर\s+मिलेंगे|"
+    r"ಧನ್ಯವಾದ|நன்றி|ধন্যবাদ)",
+    re.I,
+)
+
+
+def said_goodbye(text: str) -> bool:
+    return bool(text) and bool(_GOODBYE_RE.search(str(text)))
+
